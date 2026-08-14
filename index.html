@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="description" content="Send folders between two Macs on the same Wi-Fi. Files never leave your network." />
+    <title>Mac Transfer</title>
+  </head>
+  <body>
+    <div class="shell">
+      <header class="top">
+        <div class="brand">
+          <span class="mark" aria-hidden="true"></span>
+          <div>
+            <p class="brand-name">Mac Transfer</p>
+            <p class="brand-sub">Same Wi-Fi · Chrome or Edge · up to 100 GB</p>
+          </div>
+        </div>
+        <p class="secure">Files stay on your LAN</p>
+      </header>
+
+      <div id="banner" class="banner hidden"></div>
+      <div id="warn" class="warn hidden"></div>
+
+      <main>
+        <section id="view-home" class="view">
+          <h1>Move a folder from this Mac to the other one.</h1>
+          <p class="lede">
+            Both computers open this page, join the same room, and the folder streams disk-to-disk over Wi-Fi.
+            GitHub never sees the files.
+          </p>
+          <div class="actions">
+            <button id="btn-send" class="btn primary" type="button">Send a folder</button>
+            <button id="btn-recv" class="btn" type="button">Receive a folder</button>
+          </div>
+          <div id="resume-card" class="card hidden">
+            <p class="card-kicker">Unfinished transfer</p>
+            <p id="resume-text" class="card-body"></p>
+            <div class="actions tight">
+              <button id="btn-resume" class="btn primary" type="button">Resume</button>
+              <button id="btn-resume-dismiss" class="btn ghost" type="button">Dismiss</button>
+            </div>
+          </div>
+        </section>
+
+        <section id="view-send-scan" class="view hidden">
+          <h1>Scanning folder…</h1>
+          <p id="scan-status" class="lede">Reading names and sizes. Nothing is copied yet.</p>
+        </section>
+
+        <section id="view-send-ready" class="view hidden">
+          <h1>Ready to send</h1>
+          <dl class="stats">
+            <div><dt>Folder</dt><dd id="send-folder-name">—</dd></div>
+            <div><dt>Files</dt><dd id="send-file-count">—</dd></div>
+            <div><dt>Size</dt><dd id="send-total-size">—</dd></div>
+          </dl>
+          <p id="send-hint" class="hint"></p>
+          <label class="check">
+            <input id="chk-verify" type="checkbox" checked />
+            Verify SHA-256 checksums (safer, a bit slower)
+          </label>
+          <div class="actions">
+            <button id="btn-create-room" class="btn primary" type="button">Create room</button>
+            <button id="btn-send-cancel" class="btn ghost" type="button">Back</button>
+          </div>
+        </section>
+
+        <section id="view-send-wait" class="view hidden">
+          <h1>On the other Mac, join this room</h1>
+          <p class="lede">Open Mac Transfer in Chrome or Edge, tap Receive, and type this code.</p>
+          <div class="code-box">
+            <p id="room-code" class="room-code">————</p>
+            <button id="btn-copy" class="btn ghost" type="button">Copy</button>
+          </div>
+          <p id="join-link-wrap" class="hint">
+            Or share this link: <a id="join-link" href="#"></a>
+          </p>
+          <p id="wait-status" class="status">Waiting for the other Mac…</p>
+        </section>
+
+        <section id="view-recv-join" class="view hidden">
+          <h1>Join a room</h1>
+          <p class="lede">Type the code shown on the sending Mac, then choose where the folder should land.</p>
+          <label class="field">
+            <span>Room code</span>
+            <input id="join-code" type="text" maxlength="8" autocomplete="off" spellcheck="false" placeholder="e.g. 7K3M9Q" />
+          </label>
+          <div class="actions">
+            <button id="btn-join" class="btn primary" type="button">Choose folder & join</button>
+            <button id="btn-recv-cancel" class="btn ghost" type="button">Back</button>
+          </div>
+        </section>
+
+        <section id="view-connecting" class="view hidden">
+          <h1>Connecting</h1>
+          <p id="connect-status" class="lede">Handshaking, then opening a direct Wi-Fi link…</p>
+        </section>
+
+        <section id="view-transfer" class="view hidden">
+          <h1 id="transfer-title">Transferring</h1>
+          <p id="transfer-file" class="lede">—</p>
+          <div class="bar" aria-hidden="true">
+            <div id="bar-fill" class="bar-fill"></div>
+          </div>
+          <dl class="stats compact">
+            <div><dt>Progress</dt><dd id="xfer-pct">0%</dd></div>
+            <div><dt>Moved</dt><dd id="xfer-bytes">—</dd></div>
+            <div><dt>Speed</dt><dd id="xfer-speed">—</dd></div>
+            <div><dt>ETA</dt><dd id="xfer-eta">—</dd></div>
+          </dl>
+          <p class="hint">Keep both laptops awake and this tab visible. Sleeping will pause the transfer.</p>
+          <div class="actions">
+            <button id="btn-pause" class="btn" type="button">Pause</button>
+            <button id="btn-cancel" class="btn danger" type="button">Cancel</button>
+          </div>
+        </section>
+
+        <section id="view-done" class="view hidden">
+          <h1 id="done-title">Done</h1>
+          <p id="done-body" class="lede"></p>
+          <div class="actions">
+            <button id="btn-again" class="btn primary" type="button">Transfer another folder</button>
+          </div>
+        </section>
+
+        <section id="view-error" class="view hidden">
+          <h1>Could not finish</h1>
+          <p id="error-body" class="lede"></p>
+          <div class="actions">
+            <button id="btn-error-home" class="btn primary" type="button">Start over</button>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <p>Hosted as a static page. The handshake is a few kilobytes; the folder goes Mac to Mac.</p>
+      </footer>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
