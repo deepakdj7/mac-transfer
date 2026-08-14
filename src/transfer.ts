@@ -102,6 +102,21 @@ export function wireLimit(pc?: RTCPeerConnection): number {
   return Math.max(8 * 1024, Math.min(48 * 1024, Math.floor(max) - 32))
 }
 
+async function waitForFileAck(inbox: ChannelInbox, index: number): Promise<void> {
+  const deadline = Date.now() + 180000
+  while (Date.now() < deadline) {
+    const event = await inbox.next()
+    if (event.kind === 'close') {
+      throw new Error('Connection lost. Copied files are kept — continue when both Macs are back on the same Wi-Fi.')
+    }
+    if (event.kind !== 'control') continue
+    if (event.message.type === 'file-ack' && event.message.index === index) return
+    if (event.message.type === 'error') throw new Error(event.message.message)
+    if (event.message.type === 'cancel') throw new Error(event.message.reason ?? 'Transfer cancelled')
+  }
+  throw new Error('Connection stalled while waiting for the other Mac. Continue to resume remaining files.')
+}
+
 function encodedSize(value: unknown): number {
   return new TextEncoder().encode(JSON.stringify(value)).length
 }
@@ -453,6 +468,7 @@ export async function sendFolder(options: {
 
     await waitUntilDrained(lanes)
     sendControl(channel, { type: 'file-end', index, sha256: hasher ? await hasher.digest() : undefined })
+    await waitForFileAck(inbox, index)
     known.status = 'done'
     known.bytes = file.size
     currentSent = 0
@@ -536,6 +552,7 @@ export async function receiveFolder(options: {
   let ioLock = Promise.resolve()
   let outstanding = 0
   let lastSave = 0
+  let pendingEnd: { index: number; sha256?: string } | null = null
   const earlyChunks: Array<{ offset: number; payload: Uint8Array }> = []
 
   const runExclusive = (fn: () => Promise<void>) => {
@@ -551,6 +568,42 @@ export async function receiveFolder(options: {
       await io.writable.write({ type: 'write', position: offset, data: payload.slice() })
       outstanding -= payload.byteLength
     })
+  }
+
+  const finishCurrentFile = async (sha256?: string) => {
+    if (currentSize > 0 && received < currentSize) return false
+    await writeQueue
+    if (io.writable) {
+      await io.writable.close()
+      io.writable = null
+    }
+    if (manifest?.verifyChecksums && sha256 && io.hasher) {
+      const digest = await io.hasher.digest()
+      if (digest !== sha256) throw new Error(`Checksum mismatch for ${currentPath}`)
+    }
+    if (checklist[currentIndex]) {
+      checklist[currentIndex].status = 'done'
+      checklist[currentIndex].bytes = currentSize
+    }
+    if (manifest && (Date.now() - lastSave > 2000 || currentIndex === manifest.files.length - 1)) {
+      lastSave = Date.now()
+      const summary = summarizeChecklist(checklist)
+      await saveSession({
+        roomCode,
+        role: 'receiver',
+        manifest,
+        fileIndex: currentIndex + 1,
+        fileOffset: 0,
+        bytesDone: summary.bytesDone,
+        verifyChecksums: manifest.verifyChecksums,
+        updatedAt: Date.now(),
+        status: 'active',
+        files: checklist,
+      })
+    }
+    sendControl(channel, { type: 'file-ack', index: currentIndex })
+    pendingEnd = null
+    return true
   }
 
   const acceptChunk = async (buffer: ArrayBuffer) => {
@@ -585,6 +638,9 @@ export async function receiveFolder(options: {
           filesTotal: checklist.length,
         })
       }
+      if (pendingEnd && (currentSize === 0 || received >= currentSize)) {
+        await finishCurrentFile(pendingEnd.sha256)
+      }
     })
   }
 
@@ -609,7 +665,9 @@ export async function receiveFolder(options: {
   try {
     while (true) {
       const event = await inbox.next()
-      if (event.kind === 'close') throw new Error('Connection closed before the transfer finished')
+      if (event.kind === 'close') {
+        throw new Error('Connection lost. Copied files are kept — continue when both Macs are back on the same Wi-Fi.')
+      }
 
       if (event.kind === 'control') {
         const msg = event.message
@@ -697,35 +755,10 @@ export async function receiveFolder(options: {
           })
         }
         if (msg.type === 'file-end') {
-          await writeQueue
-          if (io.writable) {
-            await io.writable.close()
-            io.writable = null
-          }
-          if (manifest?.verifyChecksums && msg.sha256 && io.hasher) {
-            const digest = await io.hasher.digest()
-            if (digest !== msg.sha256) throw new Error(`Checksum mismatch for ${currentPath}`)
-          }
-          if (checklist[currentIndex]) {
-            checklist[currentIndex].status = 'done'
-            checklist[currentIndex].bytes = currentSize
-          }
-          if (manifest && (Date.now() - lastSave > 2000 || currentIndex === manifest.files.length - 1)) {
-            lastSave = Date.now()
-            const summary = summarizeChecklist(checklist)
-            await saveSession({
-              roomCode,
-              role: 'receiver',
-              manifest,
-              fileIndex: currentIndex + 1,
-              fileOffset: 0,
-              bytesDone: summary.bytesDone,
-              verifyChecksums: manifest.verifyChecksums,
-              updatedAt: Date.now(),
-              status: 'active',
-              files: checklist,
-            })
-          }
+          pendingEnd = { index: msg.index, sha256: msg.sha256 }
+          await runExclusive(async () => {
+            await finishCurrentFile(msg.sha256)
+          })
         }
         if (msg.type === 'done') {
           await writeQueue

@@ -29,6 +29,7 @@ export type ControlMessage =
   | { type: 'manifest-end' }
   | { type: 'file-start'; index: number; path: string; size: number; offset: number }
   | { type: 'file-end'; index: number; sha256?: string }
+  | { type: 'file-ack'; index: number }
   | { type: 'done' }
   | { type: 'pause' }
   | { type: 'resume' }

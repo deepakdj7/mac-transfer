@@ -162,7 +162,10 @@ async function connect(nextRole: Role, code: string): Promise<void> {
       $('connect-status').textContent = text
       $('wait-status').textContent = text
     },
-    onError: (error) => fail(error),
+    onError: (error) => {
+      if (peer) return
+      fail(error)
+    },
   })
 
   if (nextRole === 'sender') {
