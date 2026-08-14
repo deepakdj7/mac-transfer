@@ -96,6 +96,41 @@ export function sendControl(channel: RTCDataChannel, message: ControlMessage): v
   channel.send(JSON.stringify(message))
 }
 
+export function wireLimit(pc?: RTCPeerConnection): number {
+  const announced = pc?.sctp?.maxMessageSize
+  const max = Number.isFinite(announced) && announced && announced > 0 ? announced : 65536
+  return Math.max(8 * 1024, Math.min(48 * 1024, Math.floor(max) - 32))
+}
+
+function encodedSize(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).length
+}
+
+function sendBatched<T>(
+  channel: RTCDataChannel,
+  limit: number,
+  start: ControlMessage,
+  itemMessage: (batch: T[]) => ControlMessage,
+  end: ControlMessage,
+  items: T[],
+): void {
+  sendControl(channel, start)
+  let batch: T[] = []
+  for (const item of items) {
+    batch.push(item)
+    if (encodedSize(itemMessage(batch)) > limit) {
+      const last = batch.pop()
+      if (batch.length) sendControl(channel, itemMessage(batch))
+      batch = last === undefined ? [] : [last]
+      if (encodedSize(itemMessage(batch)) > limit) {
+        throw new Error('A file path is too long to send over the connection')
+      }
+    }
+  }
+  if (batch.length) sendControl(channel, itemMessage(batch))
+  sendControl(channel, end)
+}
+
 export function listenRemoteGate(channel: RTCDataChannel, gate: TransferGate): void {
   channel.addEventListener('message', (event) => {
     if (typeof event.data !== 'string') return
@@ -233,6 +268,7 @@ function throttleProgress(onProgress: (progress: TransferProgress) => void) {
 export async function sendFolder(options: {
   channel: RTCDataChannel
   dataChannels: RTCDataChannel[]
+  pc?: RTCPeerConnection
   inbox: ChannelInbox
   roomCode: string
   files: ScannedFile[]
@@ -241,6 +277,8 @@ export async function sendFolder(options: {
   onProgress: (progress: TransferProgress) => void
 }): Promise<void> {
   const { channel, inbox, roomCode, files, manifest, gate, onProgress } = options
+  const limit = wireLimit(options.pc)
+  const chunkSize = Math.min(CHUNK_SIZE, limit - 8)
   const lanes =
     manifest.verifyChecksums || options.dataChannels.length === 0
       ? [options.dataChannels[0] ?? channel]
@@ -281,18 +319,43 @@ export async function sendFolder(options: {
     if (event.kind === 'close') throw new Error('Connection closed while waiting for the receiver')
   }
 
-  sendControl(channel, { type: 'manifest', manifest })
+  sendBatched(
+    channel,
+    limit,
+    {
+      type: 'manifest-start',
+      folderName: manifest.folderName,
+      totalBytes: manifest.totalBytes,
+      verifyChecksums: manifest.verifyChecksums,
+      count: manifest.files.length,
+    },
+    (batch) => ({ type: 'manifest-part', files: batch }),
+    { type: 'manifest-end' },
+    manifest.files,
+  )
 
   let inventory: Array<{ path: string; bytes: number }> | undefined
+  const inventoryParts: Array<{ path: string; bytes: number }> = []
   const inventoryDeadline = Date.now() + 120000
   while (!inventory) {
     if (Date.now() > inventoryDeadline) throw new Error('Receiver did not report which files are already copied')
     const event = await inbox.next()
-    if (event.kind === 'control' && event.message.type === 'inventory') {
+    if (event.kind === 'close') throw new Error('Connection closed while waiting for the file list')
+    if (event.kind !== 'control') continue
+    if (event.message.type === 'inventory') {
       inventory = event.message.files
       break
     }
-    if (event.kind === 'close') throw new Error('Connection closed while waiting for the file list')
+    if (event.message.type === 'inventory-start') {
+      inventoryParts.length = 0
+    }
+    if (event.message.type === 'inventory-part') {
+      inventoryParts.push(...event.message.files)
+    }
+    if (event.message.type === 'inventory-end') {
+      inventory = inventoryParts
+      break
+    }
   }
 
   checklist = applyInventory(manifest.files, inventory)
@@ -362,11 +425,11 @@ export async function sendFolder(options: {
       nextRead = pos < blob.size ? blob.slice(pos, Math.min(pos + READ_AHEAD, blob.size)).arrayBuffer() : null
       hasher?.update(new Uint8Array(block))
 
-      for (let inner = 0; inner < block.byteLength; inner += CHUNK_SIZE) {
+      for (let inner = 0; inner < block.byteLength; inner += chunkSize) {
         await gate.waitIfPaused()
         const lane = pickChannel(lanes)
         await waitForBuffer(lane)
-        const piece = block.slice(inner, Math.min(inner + CHUNK_SIZE, block.byteLength))
+        const piece = block.slice(inner, Math.min(inner + chunkSize, block.byteLength))
         const fileOffset = sent
         lane.send(encodeChunk(fileOffset, piece))
         sent += piece.byteLength
@@ -433,6 +496,7 @@ export async function sendFolder(options: {
 export async function receiveFolder(options: {
   channel: RTCDataChannel
   dataChannels: RTCDataChannel[]
+  pc?: RTCPeerConnection
   inbox: ChannelInbox
   roomCode: string
   dest: FileSystemDirectoryHandle
@@ -441,6 +505,7 @@ export async function receiveFolder(options: {
   onProgress: (progress: TransferProgress) => void
 }): Promise<void> {
   const { channel, inbox, roomCode, dest, gate, onManifest, onProgress } = options
+  const limit = wireLimit(options.pc)
   const lanes = options.dataChannels.length > 0 ? options.dataChannels : [channel]
   const speed = new Speedometer()
   const progress = throttleProgress(onProgress)
@@ -460,6 +525,8 @@ export async function receiveFolder(options: {
     hasher: null as Awaited<ReturnType<typeof createHasher>> | null,
   }
   let manifest: Manifest | null = null
+  let manifestParts: Manifest['files'] = []
+  let pendingManifest: Omit<Manifest, 'files'> | null = null
   let currentIndex = 0
   let currentPath = ''
   let currentSize = 0
@@ -550,9 +617,26 @@ export async function receiveFolder(options: {
         if (msg.type === 'cancel') throw new Error(msg.reason ?? 'Sender cancelled')
         if (msg.type === 'pause') gate.pause()
         if (msg.type === 'resume') gate.resume()
-        if (msg.type === 'manifest') {
+        if (msg.type === 'manifest-start') {
+          pendingManifest = {
+            folderName: msg.folderName,
+            totalBytes: msg.totalBytes,
+            verifyChecksums: msg.verifyChecksums,
+          }
+          manifestParts = []
+        }
+        if (msg.type === 'manifest-part') {
+          manifestParts.push(...msg.files)
+        }
+        if (msg.type === 'manifest' || msg.type === 'manifest-end') {
           window.clearInterval(retry)
-          manifest = msg.manifest
+          if (msg.type === 'manifest') {
+            manifest = msg.manifest
+          } else if (pendingManifest) {
+            manifest = { ...pendingManifest, files: manifestParts }
+          } else {
+            throw new Error('Folder list arrived in the wrong order')
+          }
           onManifest(manifest)
           onManifest({ ...manifest, folderName: `${manifest.folderName} · checking already-copied files` })
           const present = await inventoryFolder(dest)
@@ -563,7 +647,14 @@ export async function receiveFolder(options: {
           checklist = applyInventory(manifest.files, report)
           const summary = summarizeChecklist(checklist)
           bytesDone = summary.bytesDone
-          sendControl(channel, { type: 'inventory', files: report })
+          sendBatched(
+            channel,
+            limit,
+            { type: 'inventory-start', count: report.length },
+            (batch) => ({ type: 'inventory-part', files: batch }),
+            { type: 'inventory-end' },
+            report,
+          )
           progress.push(
             {
               fileIndex: 0,

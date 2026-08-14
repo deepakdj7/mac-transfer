@@ -223,6 +223,7 @@ async function beginSend(existingCode?: string): Promise<void> {
     await sendFolder({
       channel: peer!.channel,
       dataChannels: peer!.dataChannels,
+      pc: peer!.pc,
       inbox,
       roomCode: code,
       files: scanned,
@@ -269,6 +270,7 @@ async function beginReceive(code: string, resume?: SessionRecord): Promise<void>
     await receiveFolder({
       channel: peer!.channel,
       dataChannels: peer!.dataChannels,
+      pc: peer!.pc,
       inbox,
       roomCode: code,
       dest: destHandle,

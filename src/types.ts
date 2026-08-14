@@ -24,6 +24,9 @@ export type Manifest = {
 
 export type ControlMessage =
   | { type: 'manifest'; manifest: Manifest }
+  | { type: 'manifest-start'; folderName: string; totalBytes: number; verifyChecksums: boolean; count: number }
+  | { type: 'manifest-part'; files: FileEntry[] }
+  | { type: 'manifest-end' }
   | { type: 'file-start'; index: number; path: string; size: number; offset: number }
   | { type: 'file-end'; index: number; sha256?: string }
   | { type: 'done' }
@@ -32,6 +35,9 @@ export type ControlMessage =
   | { type: 'cancel'; reason?: string }
   | { type: 'ready'; resumeFrom?: { index: number; offset: number } }
   | { type: 'inventory'; files: Array<{ path: string; bytes: number }> }
+  | { type: 'inventory-start'; count: number }
+  | { type: 'inventory-part'; files: Array<{ path: string; bytes: number }> }
+  | { type: 'inventory-end' }
   | { type: 'error'; message: string }
 
 export type SignalMessage =
@@ -66,7 +72,7 @@ export type SessionRecord = {
   files?: FileProgress[]
 }
 
-export const CHUNK_SIZE = 256 * 1024
+export const CHUNK_SIZE = 48 * 1024
 export const READ_AHEAD = 4 * 1024 * 1024
 export const BUFFER_HIGH = 16 * 1024 * 1024
 export const BUFFER_LOW = 8 * 1024 * 1024
