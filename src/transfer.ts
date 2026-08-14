@@ -92,6 +92,20 @@ export function sendControl(channel: RTCDataChannel, message: ControlMessage): v
   channel.send(JSON.stringify(message))
 }
 
+export function listenRemoteGate(channel: RTCDataChannel, gate: TransferGate): void {
+  channel.addEventListener('message', (event) => {
+    if (typeof event.data !== 'string') return
+    try {
+      const message = JSON.parse(event.data) as ControlMessage
+      if (message.type === 'pause') gate.pause()
+      if (message.type === 'resume') gate.resume()
+      if (message.type === 'cancel') gate.cancel()
+    } catch {
+      // ignore non-control text
+    }
+  })
+}
+
 async function waitForBuffer(channel: RTCDataChannel): Promise<void> {
   if (channel.readyState !== 'open') throw new Error('Connection closed')
   if (channel.bufferedAmount <= BUFFER_HIGH) return
@@ -140,6 +154,7 @@ export async function sendFolder(options: {
   onProgress: (progress: TransferProgress) => void
 }): Promise<void> {
   const { channel, inbox, roomCode, files, manifest, gate, onProgress } = options
+  listenRemoteGate(channel, gate)
   const speed = new Speedometer()
 
   let readyResume: { index: number; offset: number } | undefined
