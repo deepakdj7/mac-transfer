@@ -32,8 +32,16 @@ function reqToPromise<T>(req: IDBRequest<T>): Promise<T> {
 export async function saveSession(session: SessionRecord): Promise<void> {
   const db = await openDb()
   const tx = db.transaction(SESSION_STORE, 'readwrite')
-  await reqToPromise(tx.objectStore(SESSION_STORE).put(session))
+  await reqToPromise(tx.objectStore(SESSION_STORE).put({ ...session, roomCode: session.roomCode.toUpperCase() }))
   db.close()
+}
+
+export async function patchSession(roomCode: string, patch: Partial<SessionRecord>): Promise<SessionRecord | undefined> {
+  const current = await getSession(roomCode)
+  if (!current) return undefined
+  const next = { ...current, ...patch, roomCode: roomCode.toUpperCase(), updatedAt: Date.now() }
+  await saveSession(next)
+  return next
 }
 
 export async function getSession(roomCode: string): Promise<SessionRecord | undefined> {
@@ -49,9 +57,9 @@ export async function latestSession(): Promise<SessionRecord | undefined> {
   const tx = db.transaction(SESSION_STORE, 'readonly')
   const values = (await reqToPromise(tx.objectStore(SESSION_STORE).getAll())) as SessionRecord[]
   db.close()
-  const dayAgo = Date.now() - 24 * 60 * 60 * 1000
+  const weekAgo = Date.now() - 7 * 24 * 60 * 60 * 1000
   return values
-    .filter((s) => s.updatedAt > dayAgo)
+    .filter((s) => s.updatedAt > weekAgo && s.status !== 'done')
     .sort((a, b) => b.updatedAt - a.updatedAt)[0]
 }
 

@@ -284,6 +284,44 @@ dd {
   margin-top: 18px;
 }
 
+.file-log {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+
+.file-log:empty {
+  display: none;
+}
+
+.file-log li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+
+.file-log li:last-child {
+  border-bottom: 0;
+}
+
+.file-log .path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-log .meta {
+  color: var(--muted);
+  flex: none;
+}
+
 footer {
   margin-top: 48px;
 }

@@ -5,6 +5,16 @@ export type FileEntry = {
   size: number
 }
 
+export type FileStatus = 'pending' | 'partial' | 'done' | 'failed'
+
+export type FileProgress = {
+  path: string
+  size: number
+  status: FileStatus
+  bytes: number
+  error?: string
+}
+
 export type Manifest = {
   folderName: string
   files: FileEntry[]
@@ -21,6 +31,7 @@ export type ControlMessage =
   | { type: 'resume' }
   | { type: 'cancel'; reason?: string }
   | { type: 'ready'; resumeFrom?: { index: number; offset: number } }
+  | { type: 'inventory'; files: Array<{ path: string; bytes: number }> }
   | { type: 'error'; message: string }
 
 export type SignalMessage =
@@ -37,6 +48,8 @@ export type TransferProgress = {
   bytesDone: number
   totalBytes: number
   speed: number
+  filesDone: number
+  filesTotal: number
 }
 
 export type SessionRecord = {
@@ -48,6 +61,9 @@ export type SessionRecord = {
   bytesDone: number
   verifyChecksums: boolean
   updatedAt: number
+  status?: 'active' | 'failed' | 'done'
+  lastError?: string
+  files?: FileProgress[]
 }
 
 export const CHUNK_SIZE = 256 * 1024

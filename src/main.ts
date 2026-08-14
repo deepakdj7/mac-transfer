@@ -1,12 +1,13 @@
 import './style.css'
 import { supportMessage } from './browser.ts'
 import { formatBytes, formatDuration, formatSpeed, normalizeRoomCode, randomRoomCode } from './format.ts'
+import { remainingFiles, summarizeChecklist } from './checklist.ts'
 import { scanFolder, summarizeScan, type ScannedFile } from './fs.ts'
 import { clearSession, ensureHandlePermission, getHandle, getSession, latestSession, saveHandle, saveSession } from './idb.ts'
 import { startPeer, type PeerConnection } from './peer.ts'
 import { joinSignalRoom, type SignalingRoom } from './signaling.ts'
 import { ChannelInbox, receiveFolder, sendControl, sendFolder, TransferGate } from './transfer.ts'
-import type { Manifest, Role, SessionRecord, SignalMessage, TransferProgress } from './types.ts'
+import type { FileProgress, Manifest, Role, SessionRecord, SignalMessage, TransferProgress } from './types.ts'
 import { WakeGuard } from './wake.ts'
 
 const views = [
@@ -34,6 +35,7 @@ let peer: PeerConnection | null = null
 let gate: TransferGate | null = null
 let wake: WakeGuard | null = null
 let signalHandler: ((message: SignalMessage) => void) | null = null
+let lastRole: Role | null = null
 const bufferedSignals: SignalMessage[] = []
 
 function show(view: View): void {
@@ -48,11 +50,49 @@ function setWarn(text: string | null): void {
   el.classList.toggle('hidden', !text)
 }
 
+function renderFileLog(target: HTMLElement, files: FileProgress[] | undefined, extra = 0): void {
+  target.replaceChildren()
+  if (!files || files.length === 0) return
+  for (const file of files) {
+    const item = document.createElement('li')
+    const path = document.createElement('span')
+    path.className = 'path'
+    path.textContent = file.path
+    const meta = document.createElement('span')
+    meta.className = 'meta'
+    const label = file.status === 'failed' ? 'failed' : file.status === 'partial' ? `${formatBytes(file.bytes)} in` : file.status
+    meta.textContent = `${label} · ${formatBytes(file.size)}`
+    item.append(path, meta)
+    target.append(item)
+  }
+  if (extra > 0) {
+    const more = document.createElement('li')
+    more.textContent = `and ${extra} more still needed`
+    target.append(more)
+  }
+}
+
 function fail(error: unknown): void {
   const message = error instanceof Error ? error.message : 'Something went wrong'
   $('error-body').textContent = message
   show('error')
   void teardown(false)
+  void (async () => {
+    if (!roomCode) return
+    const session = await getSession(roomCode)
+    if (!session?.files?.length) {
+      $('error-summary').textContent = 'Progress was saved. Continue to pick up only the files that are still missing.'
+      renderFileLog($('error-remaining'), [])
+      return
+    }
+    const summary = summarizeChecklist(session.files)
+    $('error-summary').textContent =
+      `${summary.done.toLocaleString()} of ${summary.total.toLocaleString()} files are already copied · ${summary.remaining.toLocaleString()} left` +
+      (summary.failed ? ` · ${summary.failed} failed` : '')
+    const leftover = remainingFiles(session.files)
+    renderFileLog($('error-remaining'), leftover, Math.max(0, summary.remaining - leftover.length))
+    await saveSession({ ...session, status: 'failed', lastError: message, updatedAt: Date.now() })
+  })()
 }
 
 async function teardown(clear = false): Promise<void> {
@@ -89,9 +129,14 @@ function renderProgress(progress: TransferProgress): void {
   $('xfer-speed').textContent = formatSpeed(progress.speed)
   const remain = progress.totalBytes - progress.bytesDone
   $('xfer-eta').textContent = progress.speed > 0 ? formatDuration(remain / progress.speed) : '—'
+  if (progress.filesTotal > 0) {
+    $('xfer-files').textContent =
+      `${progress.filesDone.toLocaleString()} of ${progress.filesTotal.toLocaleString()} files copied`
+  }
 }
 
 async function connect(nextRole: Role, code: string): Promise<void> {
+  lastRole = nextRole
   roomCode = code
   if (nextRole === 'receiver') {
     show('connecting')
@@ -151,16 +196,19 @@ async function beginSend(existingCode?: string): Promise<void> {
     verifyChecksums: verify,
   }
 
+  const existing = await getSession(code)
   await saveHandle(code, 'source', sourceHandle)
   await saveSession({
     roomCode: code,
     role: 'sender',
     manifest,
-    fileIndex: 0,
-    fileOffset: 0,
-    bytesDone: 0,
+    fileIndex: existing?.fileIndex ?? 0,
+    fileOffset: existing?.fileOffset ?? 0,
+    bytesDone: existing?.bytesDone ?? 0,
     verifyChecksums: verify,
     updatedAt: Date.now(),
+    status: 'active',
+    files: existing?.files,
   })
 
   try {
@@ -205,6 +253,8 @@ async function beginReceive(code: string, resume?: SessionRecord): Promise<void>
     bytesDone: resume?.bytesDone ?? 0,
     verifyChecksums: resume?.verifyChecksums ?? false,
     updatedAt: Date.now(),
+    status: 'active',
+    files: resume?.files,
   })
 
   try {
@@ -223,10 +273,6 @@ async function beginReceive(code: string, resume?: SessionRecord): Promise<void>
       roomCode: code,
       dest: destHandle,
       gate,
-      resumeFrom:
-        resume && resume.fileIndex + resume.fileOffset > 0
-          ? { index: resume.fileIndex, offset: resume.fileOffset }
-          : undefined,
       onManifest: (manifest) => {
         $('transfer-file').textContent = `Receiving ${manifest.folderName} · ${manifest.files.length} files`
       },
@@ -292,8 +338,16 @@ async function loadResumeCard(): Promise<void> {
     card.classList.add('hidden')
     return
   }
-  $('resume-text').textContent =
-    `${session.role === 'sender' ? 'Sending' : 'Receiving'} room ${session.roomCode} · ${formatBytes(session.bytesDone)} already moved.`
+  const summary = session.files?.length ? summarizeChecklist(session.files) : null
+  $('resume-text').textContent = summary
+    ? `${session.role === 'sender' ? 'Sending' : 'Receiving'} room ${session.roomCode}. ${summary.done.toLocaleString()} of ${summary.total.toLocaleString()} files already copied · ${summary.remaining.toLocaleString()} left.`
+    : `${session.role === 'sender' ? 'Sending' : 'Receiving'} room ${session.roomCode} · ${formatBytes(session.bytesDone)} already moved.`
+  const leftover = session.files ? remainingFiles(session.files) : []
+  renderFileLog(
+    $('resume-remaining'),
+    leftover,
+    summary ? Math.max(0, summary.remaining - leftover.length) : 0,
+  )
   card.classList.remove('hidden')
   card.dataset.room = session.roomCode
 }
@@ -352,7 +406,40 @@ $('btn-recv').addEventListener('click', () => {
 $('btn-send-cancel').addEventListener('click', resetHome)
 $('btn-recv-cancel').addEventListener('click', resetHome)
 $('btn-again').addEventListener('click', resetHome)
-$('btn-error-home').addEventListener('click', resetHome)
+$('btn-error-home').addEventListener('click', () => {
+  if (roomCode) void clearSession(roomCode)
+  resetHome()
+})
+
+$('btn-continue').addEventListener('click', () => {
+  void (async () => {
+    await teardown(false)
+    const session = roomCode ? await getSession(roomCode) : await latestSession()
+    const role = lastRole ?? session?.role
+    if (!session || !role) {
+      fail(new Error('No saved transfer to continue. Use the same destination folder and room code.'))
+      return
+    }
+    roomCode = session.roomCode
+    lastRole = role
+    if (role === 'sender') {
+      if (!sourceHandle) {
+        await resumeLast()
+        return
+      }
+      await beginSend(session.roomCode)
+      return
+    }
+    if (!destHandle) {
+      await resumeLast()
+      return
+    }
+    await beginReceive(session.roomCode, session)
+  })().catch((error) => {
+    if (error instanceof DOMException && error.name === 'AbortError') return
+    fail(error)
+  })
+})
 
 $('btn-create-room').addEventListener('click', () => {
   void beginSend()

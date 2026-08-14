@@ -1,5 +1,6 @@
+import { applyInventory, destBytesFor, emptyChecklist, summarizeChecklist } from './checklist.ts'
 import { createHasher } from './hash.ts'
-import { openWritable, type ScannedFile } from './fs.ts'
+import { inventoryFolder, openWritable, type ScannedFile } from './fs.ts'
 import { saveSession } from './idb.ts'
 import {
   BUFFER_HIGH,
@@ -8,6 +9,7 @@ import {
   READ_AHEAD,
   WRITE_BACKPRESSURE,
   type ControlMessage,
+  type FileProgress,
   type Manifest,
   type TransferProgress,
 } from './types.ts'
@@ -246,14 +248,34 @@ export async function sendFolder(options: {
   listenRemoteGate(channel, gate)
   const speed = new Speedometer()
   const progress = throttleProgress(onProgress)
+  let checklist: FileProgress[] = emptyChecklist(manifest.files)
+  let currentIndex = -1
+  let currentSent = 0
 
-  let readyResume: { index: number; offset: number } | undefined
+  const persist = async (status: 'active' | 'failed' | 'done' = 'active', lastError?: string) => {
+    const summary = summarizeChecklist(checklist)
+    await saveSession({
+      roomCode,
+      role: 'sender',
+      manifest,
+      fileIndex: Math.max(0, currentIndex),
+      fileOffset: currentSent,
+      bytesDone: summary.bytesDone,
+      verifyChecksums: manifest.verifyChecksums,
+      updatedAt: Date.now(),
+      status,
+      lastError,
+      files: checklist,
+    })
+  }
+
   const started = Date.now()
-  while (!readyResume) {
+  let sawReady = false
+  while (!sawReady) {
     if (Date.now() - started > 15000) throw new Error('Receiver did not become ready')
     const event = await inbox.next()
     if (event.kind === 'control' && event.message.type === 'ready') {
-      readyResume = event.message.resumeFrom ?? { index: 0, offset: 0 }
+      sawReady = true
       break
     }
     if (event.kind === 'close') throw new Error('Connection closed while waiting for the receiver')
@@ -261,15 +283,59 @@ export async function sendFolder(options: {
 
   sendControl(channel, { type: 'manifest', manifest })
 
-  let bytesDone = 0
-  for (let i = 0; i < readyResume.index; i += 1) bytesDone += files[i]?.size ?? 0
-  bytesDone += readyResume.offset
-  let lastSave = 0
+  let inventory: Array<{ path: string; bytes: number }> | undefined
+  const inventoryDeadline = Date.now() + 120000
+  while (!inventory) {
+    if (Date.now() > inventoryDeadline) throw new Error('Receiver did not report which files are already copied')
+    const event = await inbox.next()
+    if (event.kind === 'control' && event.message.type === 'inventory') {
+      inventory = event.message.files
+      break
+    }
+    if (event.kind === 'close') throw new Error('Connection closed while waiting for the file list')
+  }
 
-  for (let index = readyResume.index; index < files.length; index += 1) {
+  checklist = applyInventory(manifest.files, inventory)
+  const initial = summarizeChecklist(checklist)
+  let bytesDone = initial.bytesDone
+  let lastSave = 0
+  progress.push(
+    {
+      fileIndex: 0,
+      filePath: initial.done > 0 ? `Skipping ${initial.done} files already copied` : 'Starting transfer',
+      fileBytes: 0,
+      fileSize: 0,
+      bytesDone,
+      totalBytes: manifest.totalBytes,
+      speed: 0,
+      filesDone: initial.done,
+      filesTotal: checklist.length,
+    },
+    true,
+  )
+
+  try {
+  for (let index = 0; index < files.length; index += 1) {
     await gate.waitIfPaused()
     const file = files[index]
-    const offset = index === readyResume.index ? readyResume.offset : 0
+    const known = checklist[index] ?? {
+      path: file.path,
+      size: file.size,
+      status: 'pending' as const,
+      bytes: 0,
+    }
+    checklist[index] = known
+    const offset = destBytesFor(known)
+    if (known.status === 'done') continue
+    if (file.size > 0 && offset >= file.size) {
+      known.status = 'done'
+      known.bytes = file.size
+      continue
+    }
+    currentIndex = index
+    currentSent = offset
+    known.status = offset > 0 ? 'partial' : 'pending'
+    known.bytes = offset
     sendControl(channel, { type: 'file-start', index, path: file.path, size: file.size, offset })
 
     const blob = await file.handle.getFile()
@@ -305,6 +371,9 @@ export async function sendFolder(options: {
         lane.send(encodeChunk(fileOffset, piece))
         sent += piece.byteLength
         bytesDone += piece.byteLength
+        currentSent = sent
+        known.bytes = sent
+        known.status = 'partial'
         progress.push({
           fileIndex: index,
           filePath: file.path,
@@ -313,12 +382,18 @@ export async function sendFolder(options: {
           bytesDone,
           totalBytes: manifest.totalBytes,
           speed: speed.push(piece.byteLength),
+          filesDone: summarizeChecklist(checklist).done,
+          filesTotal: checklist.length,
         })
       }
     }
 
     await waitUntilDrained(lanes)
     sendControl(channel, { type: 'file-end', index, sha256: hasher ? await hasher.digest() : undefined })
+    known.status = 'done'
+    known.bytes = file.size
+    currentSent = 0
+    const summary = summarizeChecklist(checklist)
     progress.push(
       {
         fileIndex: index,
@@ -328,26 +403,31 @@ export async function sendFolder(options: {
         bytesDone,
         totalBytes: manifest.totalBytes,
         speed: speed.push(1),
+        filesDone: summary.done,
+        filesTotal: checklist.length,
       },
       true,
     )
 
-    if (Date.now() - lastSave > 4000 || index === files.length - 1) {
+    if (Date.now() - lastSave > 2000 || index === files.length - 1) {
       lastSave = Date.now()
-      await saveSession({
-        roomCode,
-        role: 'sender',
-        manifest,
-        fileIndex: index + 1,
-        fileOffset: 0,
-        bytesDone,
-        verifyChecksums: manifest.verifyChecksums,
-        updatedAt: Date.now(),
-      })
+      await persist('active')
     }
   }
 
   sendControl(channel, { type: 'done' })
+  await persist('done')
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Transfer failed'
+    if (currentIndex >= 0 && checklist[currentIndex]) {
+      const current = checklist[currentIndex]
+      current.status = currentSent > 0 ? 'partial' : 'failed'
+      current.bytes = currentSent
+      current.error = message
+    }
+    await persist('failed', message)
+    throw error
+  }
 }
 
 export async function receiveFolder(options: {
@@ -357,7 +437,6 @@ export async function receiveFolder(options: {
   roomCode: string
   dest: FileSystemDirectoryHandle
   gate: TransferGate
-  resumeFrom?: { index: number; offset: number }
   onManifest: (manifest: Manifest) => void
   onProgress: (progress: TransferProgress) => void
 }): Promise<void> {
@@ -365,11 +444,12 @@ export async function receiveFolder(options: {
   const lanes = options.dataChannels.length > 0 ? options.dataChannels : [channel]
   const speed = new Speedometer()
   const progress = throttleProgress(onProgress)
+  let checklist: FileProgress[] = []
 
-  sendControl(channel, { type: 'ready', resumeFrom: options.resumeFrom })
+  sendControl(channel, { type: 'ready' })
   const retry = window.setInterval(() => {
     try {
-      sendControl(channel, { type: 'ready', resumeFrom: options.resumeFrom })
+      sendControl(channel, { type: 'ready' })
     } catch {
       window.clearInterval(retry)
     }
@@ -380,10 +460,10 @@ export async function receiveFolder(options: {
     hasher: null as Awaited<ReturnType<typeof createHasher>> | null,
   }
   let manifest: Manifest | null = null
-  let currentIndex = options.resumeFrom?.index ?? 0
+  let currentIndex = 0
   let currentPath = ''
   let currentSize = 0
-  let received = options.resumeFrom?.offset ?? 0
+  let received = 0
   let bytesDone = 0
   let writeQueue = Promise.resolve()
   let ioLock = Promise.resolve()
@@ -422,6 +502,10 @@ export async function receiveFolder(options: {
       received += chunk.payload.byteLength
       bytesDone += chunk.payload.byteLength
       if (manifest) {
+        if (checklist[currentIndex]) {
+          checklist[currentIndex].status = 'partial'
+          checklist[currentIndex].bytes = received
+        }
         progress.push({
           fileIndex: currentIndex,
           filePath: currentPath,
@@ -430,6 +514,8 @@ export async function receiveFolder(options: {
           bytesDone,
           totalBytes: manifest.totalBytes,
           speed: speed.push(chunk.payload.byteLength),
+          filesDone: summarizeChecklist(checklist).done,
+          filesTotal: checklist.length,
         })
       }
     })
@@ -468,13 +554,33 @@ export async function receiveFolder(options: {
           window.clearInterval(retry)
           manifest = msg.manifest
           onManifest(manifest)
-          if (options.resumeFrom) {
-            bytesDone = 0
-            for (let i = 0; i < options.resumeFrom.index; i += 1) {
-              bytesDone += manifest.files[i]?.size ?? 0
-            }
-            bytesDone += options.resumeFrom.offset
-          }
+          onManifest({ ...manifest, folderName: `${manifest.folderName} · checking already-copied files` })
+          const present = await inventoryFolder(dest)
+          const report = manifest.files.map((file) => ({
+            path: file.path,
+            bytes: present.get(file.path) ?? 0,
+          }))
+          checklist = applyInventory(manifest.files, report)
+          const summary = summarizeChecklist(checklist)
+          bytesDone = summary.bytesDone
+          sendControl(channel, { type: 'inventory', files: report })
+          progress.push(
+            {
+              fileIndex: 0,
+              filePath:
+                summary.done > 0
+                  ? `${summary.done} files already on this Mac · ${summary.remaining} left`
+                  : `Receiving ${manifest.folderName} · ${manifest.files.length} files`,
+              fileBytes: 0,
+              fileSize: 0,
+              bytesDone,
+              totalBytes: manifest.totalBytes,
+              speed: 0,
+              filesDone: summary.done,
+              filesTotal: checklist.length,
+            },
+            true,
+          )
         }
         if (msg.type === 'file-start') {
           await gate.waitIfPaused()
@@ -509,22 +615,43 @@ export async function receiveFolder(options: {
             const digest = await io.hasher.digest()
             if (digest !== msg.sha256) throw new Error(`Checksum mismatch for ${currentPath}`)
           }
-          if (manifest && (Date.now() - lastSave > 4000 || currentIndex === manifest.files.length - 1)) {
+          if (checklist[currentIndex]) {
+            checklist[currentIndex].status = 'done'
+            checklist[currentIndex].bytes = currentSize
+          }
+          if (manifest && (Date.now() - lastSave > 2000 || currentIndex === manifest.files.length - 1)) {
             lastSave = Date.now()
+            const summary = summarizeChecklist(checklist)
             await saveSession({
               roomCode,
               role: 'receiver',
               manifest,
               fileIndex: currentIndex + 1,
               fileOffset: 0,
-              bytesDone,
+              bytesDone: summary.bytesDone,
               verifyChecksums: manifest.verifyChecksums,
               updatedAt: Date.now(),
+              status: 'active',
+              files: checklist,
             })
           }
         }
         if (msg.type === 'done') {
           await writeQueue
+          if (manifest) {
+            await saveSession({
+              roomCode,
+              role: 'receiver',
+              manifest,
+              fileIndex: checklist.length,
+              fileOffset: 0,
+              bytesDone: manifest.totalBytes,
+              verifyChecksums: manifest.verifyChecksums,
+              updatedAt: Date.now(),
+              status: 'done',
+              files: checklist,
+            })
+          }
           return
         }
         continue
@@ -532,6 +659,30 @@ export async function receiveFolder(options: {
 
       await acceptChunk(event.buffer)
     }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Transfer failed'
+    if (checklist[currentIndex]) {
+      checklist[currentIndex].status = received > 0 ? 'partial' : 'failed'
+      checklist[currentIndex].bytes = received
+      checklist[currentIndex].error = message
+    }
+    if (manifest) {
+      const summary = summarizeChecklist(checklist)
+      await saveSession({
+        roomCode,
+        role: 'receiver',
+        manifest,
+        fileIndex: currentIndex,
+        fileOffset: received,
+        bytesDone: summary.bytesDone,
+        verifyChecksums: manifest.verifyChecksums,
+        updatedAt: Date.now(),
+        status: 'failed',
+        lastError: message,
+        files: checklist,
+      })
+    }
+    throw error
   } finally {
     window.clearInterval(retry)
     for (const lane of lanes) {

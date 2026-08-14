@@ -68,6 +68,11 @@ export async function openWritable(
   return writable
 }
 
+export async function inventoryFolder(root: FileSystemDirectoryHandle): Promise<Map<string, number>> {
+  const files = await scanFolder(root)
+  return new Map(files.map((file) => [file.path, file.size]))
+}
+
 export function summarizeScan(files: ScannedFile[]): { tinyFiles: number; hugeFiles: number } {
   let tinyFiles = 0
   let hugeFiles = 0

@@ -37,9 +37,10 @@
           <div id="resume-card" class="card hidden">
             <p class="card-kicker">Unfinished transfer</p>
             <p id="resume-text" class="card-body"></p>
+            <ul id="resume-remaining" class="file-log"></ul>
             <div class="actions tight">
-              <button id="btn-resume" class="btn primary" type="button">Resume</button>
-              <button id="btn-resume-dismiss" class="btn ghost" type="button">Dismiss</button>
+              <button id="btn-resume" class="btn primary" type="button">Continue</button>
+              <button id="btn-resume-dismiss" class="btn ghost" type="button">Discard progress</button>
             </div>
           </div>
         </section>
@@ -110,7 +111,8 @@
             <div><dt>Speed</dt><dd id="xfer-speed">—</dd></div>
             <div><dt>ETA</dt><dd id="xfer-eta">—</dd></div>
           </dl>
-          <p class="hint">Keep both laptops awake and this tab visible. Sleeping will pause the transfer.</p>
+          <p id="xfer-files" class="status">0 of 0 files copied</p>
+          <p class="hint">Already-copied files are skipped if you continue after a drop. Keep both tabs visible.</p>
           <div class="actions">
             <button id="btn-pause" class="btn" type="button">Pause</button>
             <button id="btn-cancel" class="btn danger" type="button">Cancel</button>
@@ -126,10 +128,14 @@
         </section>
 
         <section id="view-error" class="view hidden">
-          <h1>Could not finish</h1>
+          <h1>Transfer paused</h1>
           <p id="error-body" class="lede"></p>
+          <p id="error-summary" class="status"></p>
+          <ul id="error-remaining" class="file-log"></ul>
+          <p class="hint">Copied files stay on the receiving Mac. Continue uses the same room and skips what is already there.</p>
           <div class="actions">
-            <button id="btn-error-home" class="btn primary" type="button">Start over</button>
+            <button id="btn-continue" class="btn primary" type="button">Continue from here</button>
+            <button id="btn-error-home" class="btn ghost" type="button">Start over</button>
           </div>
         </section>
       </main>
