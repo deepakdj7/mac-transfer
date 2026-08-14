@@ -50,6 +50,9 @@ export type SessionRecord = {
   updatedAt: number
 }
 
-export const CHUNK_SIZE = 64 * 1024
-export const BUFFER_HIGH = 2 * 1024 * 1024
-export const BUFFER_LOW = 512 * 1024
+export const CHUNK_SIZE = 256 * 1024
+export const READ_AHEAD = 4 * 1024 * 1024
+export const BUFFER_HIGH = 16 * 1024 * 1024
+export const BUFFER_LOW = 8 * 1024 * 1024
+export const DATA_CHANNEL_COUNT = 4
+export const WRITE_BACKPRESSURE = 32 * 1024 * 1024

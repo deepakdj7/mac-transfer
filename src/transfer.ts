@@ -5,6 +5,8 @@ import {
   BUFFER_HIGH,
   BUFFER_LOW,
   CHUNK_SIZE,
+  READ_AHEAD,
+  WRITE_BACKPRESSURE,
   type ControlMessage,
   type Manifest,
   type TransferProgress,
@@ -106,6 +108,31 @@ export function listenRemoteGate(channel: RTCDataChannel, gate: TransferGate): v
   })
 }
 
+function pickChannel(channels: RTCDataChannel[]): RTCDataChannel {
+  let best = channels[0]
+  for (const channel of channels) {
+    if (channel.readyState === 'open' && channel.bufferedAmount < best.bufferedAmount) {
+      best = channel
+    }
+  }
+  return best
+}
+
+function encodeChunk(offset: number, payload: ArrayBuffer): ArrayBuffer {
+  const out = new ArrayBuffer(8 + payload.byteLength)
+  new DataView(out).setBigUint64(0, BigInt(offset), false)
+  new Uint8Array(out, 8).set(new Uint8Array(payload))
+  return out
+}
+
+function decodeChunk(buffer: ArrayBuffer): { offset: number; payload: Uint8Array } {
+  const view = new DataView(buffer)
+  return {
+    offset: Number(view.getBigUint64(0, false)),
+    payload: new Uint8Array(buffer, 8),
+  }
+}
+
 async function waitForBuffer(channel: RTCDataChannel): Promise<void> {
   if (channel.readyState !== 'open') throw new Error('Connection closed')
   if (channel.bufferedAmount <= BUFFER_HIGH) return
@@ -126,6 +153,38 @@ async function waitForBuffer(channel: RTCDataChannel): Promise<void> {
   })
 }
 
+async function waitUntilDrained(channels: RTCDataChannel[]): Promise<void> {
+  await Promise.all(
+    channels.map(
+      (channel) =>
+        new Promise<void>((resolve, reject) => {
+          if (channel.readyState !== 'open') {
+            reject(new Error('Connection closed'))
+            return
+          }
+          if (channel.bufferedAmount === 0) {
+            resolve()
+            return
+          }
+          const done = () => {
+            if (channel.bufferedAmount > 0) return
+            channel.removeEventListener('bufferedamountlow', done)
+            channel.removeEventListener('close', onClose)
+            resolve()
+          }
+          const onClose = () => {
+            channel.removeEventListener('bufferedamountlow', done)
+            channel.removeEventListener('close', onClose)
+            reject(new Error('Connection closed'))
+          }
+          channel.bufferedAmountLowThreshold = 0
+          channel.addEventListener('bufferedamountlow', done)
+          channel.addEventListener('close', onClose)
+        }),
+    ),
+  )
+}
+
 class Speedometer {
   private samples: Array<{ t: number; bytes: number }> = []
 
@@ -144,8 +203,34 @@ class Speedometer {
   }
 }
 
+function throttleProgress(onProgress: (progress: TransferProgress) => void) {
+  let last = 0
+  let pending: TransferProgress | null = null
+  let timer = 0
+  const flush = () => {
+    timer = 0
+    if (!pending) return
+    onProgress(pending)
+    pending = null
+    last = performance.now()
+  }
+  return {
+    push(progress: TransferProgress, force = false) {
+      pending = progress
+      const now = performance.now()
+      if (force || now - last >= 120) {
+        if (timer) window.clearTimeout(timer)
+        flush()
+        return
+      }
+      if (!timer) timer = window.setTimeout(flush, 120)
+    },
+  }
+}
+
 export async function sendFolder(options: {
   channel: RTCDataChannel
+  dataChannels: RTCDataChannel[]
   inbox: ChannelInbox
   roomCode: string
   files: ScannedFile[]
@@ -154,36 +239,32 @@ export async function sendFolder(options: {
   onProgress: (progress: TransferProgress) => void
 }): Promise<void> {
   const { channel, inbox, roomCode, files, manifest, gate, onProgress } = options
+  const lanes =
+    manifest.verifyChecksums || options.dataChannels.length === 0
+      ? [options.dataChannels[0] ?? channel]
+      : options.dataChannels
   listenRemoteGate(channel, gate)
   const speed = new Speedometer()
+  const progress = throttleProgress(onProgress)
 
   let readyResume: { index: number; offset: number } | undefined
-  const readyDeadline = window.setTimeout(() => {
-    /* deadline is checked after each event */
-  }, 15000)
   const started = Date.now()
   while (!readyResume) {
-    if (Date.now() - started > 15000) {
-      window.clearTimeout(readyDeadline)
-      throw new Error('Receiver did not become ready')
-    }
+    if (Date.now() - started > 15000) throw new Error('Receiver did not become ready')
     const event = await inbox.next()
     if (event.kind === 'control' && event.message.type === 'ready') {
       readyResume = event.message.resumeFrom ?? { index: 0, offset: 0 }
       break
     }
-    if (event.kind === 'close') {
-      window.clearTimeout(readyDeadline)
-      throw new Error('Connection closed while waiting for the receiver')
-    }
+    if (event.kind === 'close') throw new Error('Connection closed while waiting for the receiver')
   }
-  window.clearTimeout(readyDeadline)
 
   sendControl(channel, { type: 'manifest', manifest })
 
   let bytesDone = 0
   for (let i = 0; i < readyResume.index; i += 1) bytesDone += files[i]?.size ?? 0
   bytesDone += readyResume.offset
+  let lastSave = 0
 
   for (let index = readyResume.index; index < files.length; index += 1) {
     await gate.waitIfPaused()
@@ -205,38 +286,65 @@ export async function sendFolder(options: {
       }
     }
 
-    for (let pos = offset; pos < blob.size; pos += CHUNK_SIZE) {
+    let pos = offset
+    let nextRead = pos < blob.size ? blob.slice(pos, Math.min(pos + READ_AHEAD, blob.size)).arrayBuffer() : null
+
+    while (nextRead) {
       await gate.waitIfPaused()
-      const slice = blob.slice(pos, Math.min(pos + CHUNK_SIZE, blob.size))
-      const buffer = await slice.arrayBuffer()
-      const bytes = new Uint8Array(buffer)
-      hasher?.update(bytes)
-      await waitForBuffer(channel)
-      channel.send(buffer)
-      sent += bytes.byteLength
-      bytesDone += bytes.byteLength
-      onProgress({
+      const block = await nextRead
+      pos += block.byteLength
+      nextRead = pos < blob.size ? blob.slice(pos, Math.min(pos + READ_AHEAD, blob.size)).arrayBuffer() : null
+      hasher?.update(new Uint8Array(block))
+
+      for (let inner = 0; inner < block.byteLength; inner += CHUNK_SIZE) {
+        await gate.waitIfPaused()
+        const lane = pickChannel(lanes)
+        await waitForBuffer(lane)
+        const piece = block.slice(inner, Math.min(inner + CHUNK_SIZE, block.byteLength))
+        const fileOffset = sent
+        lane.send(encodeChunk(fileOffset, piece))
+        sent += piece.byteLength
+        bytesDone += piece.byteLength
+        progress.push({
+          fileIndex: index,
+          filePath: file.path,
+          fileBytes: sent,
+          fileSize: file.size,
+          bytesDone,
+          totalBytes: manifest.totalBytes,
+          speed: speed.push(piece.byteLength),
+        })
+      }
+    }
+
+    await waitUntilDrained(lanes)
+    sendControl(channel, { type: 'file-end', index, sha256: hasher ? await hasher.digest() : undefined })
+    progress.push(
+      {
         fileIndex: index,
         filePath: file.path,
         fileBytes: sent,
         fileSize: file.size,
         bytesDone,
         totalBytes: manifest.totalBytes,
-        speed: speed.push(bytes.byteLength),
+        speed: speed.push(1),
+      },
+      true,
+    )
+
+    if (Date.now() - lastSave > 4000 || index === files.length - 1) {
+      lastSave = Date.now()
+      await saveSession({
+        roomCode,
+        role: 'sender',
+        manifest,
+        fileIndex: index + 1,
+        fileOffset: 0,
+        bytesDone,
+        verifyChecksums: manifest.verifyChecksums,
+        updatedAt: Date.now(),
       })
     }
-
-    sendControl(channel, { type: 'file-end', index, sha256: hasher ? await hasher.digest() : undefined })
-    await saveSession({
-      roomCode,
-      role: 'sender',
-      manifest,
-      fileIndex: index + 1,
-      fileOffset: 0,
-      bytesDone,
-      verifyChecksums: manifest.verifyChecksums,
-      updatedAt: Date.now(),
-    })
   }
 
   sendControl(channel, { type: 'done' })
@@ -244,6 +352,7 @@ export async function sendFolder(options: {
 
 export async function receiveFolder(options: {
   channel: RTCDataChannel
+  dataChannels: RTCDataChannel[]
   inbox: ChannelInbox
   roomCode: string
   dest: FileSystemDirectoryHandle
@@ -253,7 +362,9 @@ export async function receiveFolder(options: {
   onProgress: (progress: TransferProgress) => void
 }): Promise<void> {
   const { channel, inbox, roomCode, dest, gate, onManifest, onProgress } = options
+  const lanes = options.dataChannels.length > 0 ? options.dataChannels : [channel]
   const speed = new Speedometer()
+  const progress = throttleProgress(onProgress)
 
   sendControl(channel, { type: 'ready', resumeFrom: options.resumeFrom })
   const retry = window.setInterval(() => {
@@ -264,14 +375,83 @@ export async function receiveFolder(options: {
     }
   }, 400)
 
-  let writable: FileSystemWritableFileStream | null = null
-  let hasher: Awaited<ReturnType<typeof createHasher>> | null = null
+  const io = {
+    writable: null as FileSystemWritableFileStream | null,
+    hasher: null as Awaited<ReturnType<typeof createHasher>> | null,
+  }
   let manifest: Manifest | null = null
   let currentIndex = options.resumeFrom?.index ?? 0
   let currentPath = ''
   let currentSize = 0
   let received = options.resumeFrom?.offset ?? 0
   let bytesDone = 0
+  let writeQueue = Promise.resolve()
+  let ioLock = Promise.resolve()
+  let outstanding = 0
+  let lastSave = 0
+  const earlyChunks: Array<{ offset: number; payload: Uint8Array }> = []
+
+  const runExclusive = (fn: () => Promise<void>) => {
+    const next = ioLock.then(fn)
+    ioLock = next.catch(() => {})
+    return next
+  }
+
+  const enqueueWrite = (offset: number, payload: Uint8Array) => {
+    outstanding += payload.byteLength
+    writeQueue = writeQueue.then(async () => {
+      if (!io.writable) throw new Error('Received file data before file-start')
+      await io.writable.write({ type: 'write', position: offset, data: payload.slice() })
+      outstanding -= payload.byteLength
+    })
+  }
+
+  const acceptChunk = async (buffer: ArrayBuffer) => {
+    await gate.waitIfPaused()
+    await runExclusive(async () => {
+      const chunk = buffer.byteLength >= 8 ? decodeChunk(buffer) : { offset: received, payload: new Uint8Array(buffer) }
+      if (!io.writable) {
+        earlyChunks.push(chunk)
+      } else {
+        io.hasher?.update(chunk.payload)
+        while (outstanding > WRITE_BACKPRESSURE) {
+          await writeQueue
+        }
+        enqueueWrite(chunk.offset, chunk.payload)
+      }
+      received += chunk.payload.byteLength
+      bytesDone += chunk.payload.byteLength
+      if (manifest) {
+        progress.push({
+          fileIndex: currentIndex,
+          filePath: currentPath,
+          fileBytes: received,
+          fileSize: currentSize,
+          bytesDone,
+          totalBytes: manifest.totalBytes,
+          speed: speed.push(chunk.payload.byteLength),
+        })
+      }
+    })
+  }
+
+  const onLaneMessage = (event: MessageEvent) => {
+    const buffer =
+      event.data instanceof ArrayBuffer
+        ? event.data
+        : null
+    if (!buffer) {
+      void (event.data as Blob).arrayBuffer().then((value) => {
+        void acceptChunk(value)
+      })
+      return
+    }
+    void acceptChunk(buffer)
+  }
+
+  for (const lane of lanes) {
+    lane.addEventListener('message', onLaneMessage)
+  }
 
   try {
     while (true) {
@@ -298,28 +478,39 @@ export async function receiveFolder(options: {
         }
         if (msg.type === 'file-start') {
           await gate.waitIfPaused()
-          if (writable) {
-            await writable.close()
-            writable = null
-          }
-          if (!manifest) throw new Error('file-start arrived before the folder list')
-          currentIndex = msg.index
-          currentPath = msg.path
-          currentSize = msg.size
-          received = msg.offset
-          hasher = manifest.verifyChecksums ? await createHasher() : null
-          writable = await openWritable(dest, msg.path, msg.offset)
+          await runExclusive(async () => {
+            await writeQueue
+            if (io.writable) {
+              await io.writable.close()
+              io.writable = null
+            }
+            if (!manifest) throw new Error('file-start arrived before the folder list')
+            currentIndex = msg.index
+            currentPath = msg.path
+            currentSize = msg.size
+            received = msg.offset
+            io.hasher = manifest.verifyChecksums ? await createHasher() : null
+            io.writable = await openWritable(dest, msg.path, msg.offset)
+            writeQueue = Promise.resolve()
+            outstanding = 0
+            for (const chunk of earlyChunks.splice(0).sort((a, b) => a.offset - b.offset)) {
+              io.hasher?.update(chunk.payload)
+              enqueueWrite(chunk.offset, chunk.payload)
+            }
+          })
         }
         if (msg.type === 'file-end') {
-          if (writable) {
-            await writable.close()
-            writable = null
+          await writeQueue
+          if (io.writable) {
+            await io.writable.close()
+            io.writable = null
           }
-          if (manifest?.verifyChecksums && msg.sha256 && hasher) {
-            const digest = await hasher.digest()
+          if (manifest?.verifyChecksums && msg.sha256 && io.hasher) {
+            const digest = await io.hasher.digest()
             if (digest !== msg.sha256) throw new Error(`Checksum mismatch for ${currentPath}`)
           }
-          if (manifest) {
+          if (manifest && (Date.now() - lastSave > 4000 || currentIndex === manifest.files.length - 1)) {
+            lastSave = Date.now()
             await saveSession({
               roomCode,
               role: 'receiver',
@@ -332,32 +523,24 @@ export async function receiveFolder(options: {
             })
           }
         }
-        if (msg.type === 'done') return
+        if (msg.type === 'done') {
+          await writeQueue
+          return
+        }
         continue
       }
 
-      await gate.waitIfPaused()
-      if (!writable || !manifest) throw new Error('Received file data before file-start')
-      const bytes = new Uint8Array(event.buffer)
-      hasher?.update(bytes)
-      await writable.write(bytes)
-      received += bytes.byteLength
-      bytesDone += bytes.byteLength
-      onProgress({
-        fileIndex: currentIndex,
-        filePath: currentPath,
-        fileBytes: received,
-        fileSize: currentSize,
-        bytesDone,
-        totalBytes: manifest.totalBytes,
-        speed: speed.push(bytes.byteLength),
-      })
+      await acceptChunk(event.buffer)
     }
   } finally {
     window.clearInterval(retry)
-    if (writable) {
+    for (const lane of lanes) {
+      lane.removeEventListener('message', onLaneMessage)
+    }
+    if (io.writable) {
       try {
-        await writable.close()
+        await writeQueue
+        await io.writable.close()
       } catch {
         // already closed
       }

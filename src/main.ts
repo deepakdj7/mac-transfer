@@ -174,6 +174,7 @@ async function beginSend(existingCode?: string): Promise<void> {
     $('btn-pause').textContent = 'Pause'
     await sendFolder({
       channel: peer!.channel,
+      dataChannels: peer!.dataChannels,
       inbox,
       roomCode: code,
       files: scanned,
@@ -202,7 +203,7 @@ async function beginReceive(code: string, resume?: SessionRecord): Promise<void>
     fileIndex: resume?.fileIndex ?? 0,
     fileOffset: resume?.fileOffset ?? 0,
     bytesDone: resume?.bytesDone ?? 0,
-    verifyChecksums: resume?.verifyChecksums ?? true,
+    verifyChecksums: resume?.verifyChecksums ?? false,
     updatedAt: Date.now(),
   })
 
@@ -217,6 +218,7 @@ async function beginReceive(code: string, resume?: SessionRecord): Promise<void>
     $('btn-pause').textContent = 'Pause'
     await receiveFolder({
       channel: peer!.channel,
+      dataChannels: peer!.dataChannels,
       inbox,
       roomCode: code,
       dest: destHandle,

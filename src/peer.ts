@@ -1,12 +1,14 @@
 import type { Role, SignalMessage } from './types.ts'
+import { DATA_CHANNEL_COUNT } from './types.ts'
 import type { SignalingRoom } from './signaling.ts'
 
 const ICE_SERVERS: RTCIceServer[] = [{ urls: 'stun:stun.l.google.com:19302' }]
-const CHANNEL_LABEL = 'mac-transfer'
+const CONTROL_LABEL = 'mac-transfer'
 
 export type PeerConnection = {
   pc: RTCPeerConnection
   channel: RTCDataChannel
+  dataChannels: RTCDataChannel[]
   close: () => void
 }
 
@@ -30,13 +32,22 @@ function waitForChannelOpen(channel: RTCDataChannel): Promise<void> {
   })
 }
 
+function createDataChannel(pc: RTCPeerConnection, label: string, ordered: boolean): RTCDataChannel {
+  const channel = pc.createDataChannel(label, { ordered })
+  channel.binaryType = 'arraybuffer'
+  return channel
+}
+
 export async function startPeer(
   role: Role,
   signaling: SignalingRoom,
   attachSignal: (handler: (message: SignalMessage) => void) => void,
   onStatus?: (text: string) => void,
 ): Promise<PeerConnection> {
-  const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+  const pc = new RTCPeerConnection({
+    iceServers: ICE_SERVERS,
+    iceCandidatePoolSize: 2,
+  })
   const pendingIce: RTCIceCandidateInit[] = []
   let remoteSet = false
 
@@ -89,22 +100,30 @@ export async function startPeer(
     }
   })
 
-  let channelPromise: Promise<RTCDataChannel>
+  let channelsPromise: Promise<{ control: RTCDataChannel; data: RTCDataChannel[] }>
   if (role === 'sender') {
-    const channel = pc.createDataChannel(CHANNEL_LABEL, { ordered: true })
-    channel.binaryType = 'arraybuffer'
-    channelPromise = Promise.resolve(channel)
+    const control = createDataChannel(pc, CONTROL_LABEL, true)
+    const data = Array.from({ length: DATA_CHANNEL_COUNT }, (_, i) =>
+      createDataChannel(pc, `${CONTROL_LABEL}-d${i}`, i === 0),
+    )
+    channelsPromise = Promise.resolve({ control, data })
     onStatus?.('Creating a direct link…')
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
     signaling.publish({ type: 'offer', sdp: offer.sdp ?? '' })
   } else {
-    channelPromise = new Promise((resolve, reject) => {
+    channelsPromise = new Promise((resolve, reject) => {
+      const found = new Map<string, RTCDataChannel>()
       const timer = window.setTimeout(() => reject(new Error('Timed out waiting for data channel')), 30000)
       pc.ondatachannel = (event) => {
-        window.clearTimeout(timer)
         event.channel.binaryType = 'arraybuffer'
-        resolve(event.channel)
+        found.set(event.channel.label, event.channel)
+        const control = found.get(CONTROL_LABEL)
+        const data = Array.from({ length: DATA_CHANNEL_COUNT }, (_, i) => found.get(`${CONTROL_LABEL}-d${i}`))
+        if (control && data.every((ch) => ch)) {
+          window.clearTimeout(timer)
+          resolve({ control, data: data as RTCDataChannel[] })
+        }
       }
     })
     onStatus?.('Waiting for sender offer…')
@@ -116,10 +135,10 @@ export async function startPeer(
     signaling.publish({ type: 'answer', sdp: answer.sdp ?? '' })
   }
 
-  const channel = await Promise.race([
-    channelPromise.then(async (ch) => {
-      await waitForChannelOpen(ch)
-      return ch
+  const opened = await Promise.race([
+    channelsPromise.then(async ({ control, data }) => {
+      await Promise.all([control, ...data].map(waitForChannelOpen))
+      return { control, data }
     }),
     new Promise<never>((_, reject) => {
       window.setTimeout(() => {
@@ -134,10 +153,12 @@ export async function startPeer(
 
   return {
     pc,
-    channel,
+    channel: opened.control,
+    dataChannels: opened.data,
     close() {
       try {
-        channel.close()
+        opened.control.close()
+        for (const channel of opened.data) channel.close()
         pc.close()
       } catch {
         // ignore
