@@ -104,10 +104,6 @@ export function wireLimit(pc?: RTCPeerConnection): number {
 
 function waitForFileAck(channel: RTCDataChannel, index: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    const timer = window.setTimeout(() => {
-      cleanup()
-      resolve()
-    }, 20000)
     const onMessage = (event: MessageEvent) => {
       if (typeof event.data !== 'string') return
       let message: ControlMessage
@@ -136,7 +132,6 @@ function waitForFileAck(channel: RTCDataChannel, index: number): Promise<void> {
       reject(connectionLost())
     }
     const cleanup = () => {
-      window.clearTimeout(timer)
       channel.removeEventListener('message', onMessage)
       channel.removeEventListener('close', onClose)
     }
@@ -210,18 +205,21 @@ function pickChannel(channels: RTCDataChannel[]): RTCDataChannel {
   return best
 }
 
-function encodeChunk(offset: number, payload: ArrayBuffer): ArrayBuffer {
-  const out = new ArrayBuffer(8 + payload.byteLength)
-  new DataView(out).setBigUint64(0, BigInt(offset), false)
-  new Uint8Array(out, 8).set(new Uint8Array(payload))
+function encodeChunk(index: number, offset: number, payload: ArrayBuffer): ArrayBuffer {
+  const out = new ArrayBuffer(12 + payload.byteLength)
+  const view = new DataView(out)
+  view.setUint32(0, index, false)
+  view.setBigUint64(4, BigInt(offset), false)
+  new Uint8Array(out, 12).set(new Uint8Array(payload))
   return out
 }
 
-function decodeChunk(buffer: ArrayBuffer): { offset: number; payload: Uint8Array } {
+function decodeChunk(buffer: ArrayBuffer): { index: number; offset: number; payload: Uint8Array } {
   const view = new DataView(buffer)
   return {
-    offset: Number(view.getBigUint64(0, false)),
-    payload: new Uint8Array(buffer, 8),
+    index: view.getUint32(0, false),
+    offset: Number(view.getBigUint64(4, false)),
+    payload: new Uint8Array(buffer, 12),
   }
 }
 
@@ -491,7 +489,7 @@ export async function sendFolder(options: {
         await waitForBuffer(lane)
         const piece = block.slice(inner, Math.min(inner + chunkSize, block.byteLength))
         const fileOffset = sent
-        lane.send(encodeChunk(fileOffset, piece))
+        lane.send(encodeChunk(index, fileOffset, piece))
         sent += piece.byteLength
         bytesDone += piece.byteLength
         currentSent = sent
@@ -543,9 +541,11 @@ export async function sendFolder(options: {
     }
     } catch (error) {
       if (!linkAlive(channel, options.pc)) throw connectionLost()
+      const message = error instanceof Error ? error.message : 'File failed'
+      if (message.startsWith('Connection lost') || message === 'Transfer cancelled') throw error
       known.status = currentSent > 0 ? 'partial' : 'failed'
       known.bytes = currentSent
-      known.error = error instanceof Error ? error.message : 'File failed'
+      known.error = message
       await persist('active', known.error)
     }
   }
@@ -599,17 +599,18 @@ export async function receiveFolder(options: {
   let manifest: Manifest | null = null
   let manifestParts: Manifest['files'] = []
   let pendingManifest: Omit<Manifest, 'files'> | null = null
-  let currentIndex = 0
+  let currentIndex = -1
   let currentPath = ''
   let currentSize = 0
   let received = 0
   let bytesDone = 0
+  let fileReady = false
   let writeQueue = Promise.resolve()
   let ioLock = Promise.resolve()
   let outstanding = 0
   let lastSave = 0
   let pendingEnd: { index: number; sha256?: string } | null = null
-  const earlyChunks: Array<{ offset: number; payload: Uint8Array }> = []
+  const earlyChunks: Array<{ index: number; offset: number; payload: Uint8Array }> = []
 
   const runExclusive = (fn: () => Promise<void>) => {
     const next = ioLock.then(fn)
@@ -620,48 +621,46 @@ export async function receiveFolder(options: {
   const enqueueWrite = (offset: number, payload: Uint8Array) => {
     outstanding += payload.byteLength
     writeQueue = writeQueue.then(async () => {
-      if (!io.writable) return
+      if (!io.writable) throw new Error('Write arrived after the file was closed')
       await io.writable.write({ type: 'write', position: offset, data: payload.slice() })
-    }).catch(() => {
-      // A single write glitch must not poison the rest of the folder.
-    }).then(() => {
       outstanding = Math.max(0, outstanding - payload.byteLength)
     })
   }
 
-  const finishCurrentFile = async (_sha256?: string) => {
+  const persistProgress = (status: 'active' | 'failed' | 'done' = 'active') => {
+    if (!manifest) return
+    lastSave = Date.now()
+    const summary = summarizeChecklist(checklist)
+    void saveSession({
+      roomCode,
+      role: 'receiver',
+      manifest,
+      fileIndex: Math.max(0, currentIndex),
+      fileOffset: received,
+      bytesDone: summary.bytesDone,
+      verifyChecksums: manifest.verifyChecksums,
+      updatedAt: Date.now(),
+      status,
+      files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+    }).catch(() => {})
+  }
+
+  const finishCurrentFile = async () => {
+    if (!fileReady || !io.writable) return false
     if (currentSize > 0 && received < currentSize) return false
+    await writeQueue
     const old = io.writable
     io.writable = null
+    fileReady = false
+    if (old) await old.close()
     if (checklist[currentIndex]) {
       checklist[currentIndex].status = 'done'
       checklist[currentIndex].bytes = currentSize
     }
-    try {
-      sendControl(channel, { type: 'file-ack', index: currentIndex })
-    } catch {
-      // sender will move on if the ack is missed
-    }
+    sendControl(channel, { type: 'file-ack', index: currentIndex })
     pendingEnd = null
-    void writeQueue
-      .catch(() => {})
-      .then(() => old?.close())
-      .catch(() => {})
     if (manifest && (Date.now() - lastSave > 8000 || currentIndex === manifest.files.length - 1)) {
-      lastSave = Date.now()
-      const summary = summarizeChecklist(checklist)
-      void saveSession({
-        roomCode,
-        role: 'receiver',
-        manifest,
-        fileIndex: currentIndex + 1,
-        fileOffset: 0,
-        bytesDone: summary.bytesDone,
-        verifyChecksums: manifest.verifyChecksums,
-        updatedAt: Date.now(),
-        status: 'active',
-        files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
-      }).catch(() => {})
+      persistProgress('active')
     }
     return true
   }
@@ -669,23 +668,27 @@ export async function receiveFolder(options: {
   const acceptChunk = async (buffer: ArrayBuffer) => {
     await gate.waitIfPaused()
     await runExclusive(async () => {
-      const chunk = buffer.byteLength >= 8 ? decodeChunk(buffer) : { offset: received, payload: new Uint8Array(buffer) }
-      if (!io.writable) {
-        earlyChunks.push(chunk)
-      } else {
-        io.hasher?.update(chunk.payload)
-        while (outstanding > WRITE_BACKPRESSURE) {
-          await writeQueue
-        }
-        enqueueWrite(chunk.offset, chunk.payload)
+      const chunk =
+        buffer.byteLength >= 12
+          ? decodeChunk(buffer)
+          : { index: currentIndex, offset: received, payload: new Uint8Array(buffer) }
+      if (fileReady && chunk.index < currentIndex) return
+      if (!fileReady || !io.writable || chunk.index !== currentIndex) {
+        if (!fileReady || chunk.index >= currentIndex) earlyChunks.push(chunk)
+        return
       }
+      while (outstanding > WRITE_BACKPRESSURE) {
+        await writeQueue
+      }
+      io.hasher?.update(chunk.payload)
+      enqueueWrite(chunk.offset, chunk.payload)
       received += chunk.payload.byteLength
       bytesDone += chunk.payload.byteLength
+      if (checklist[currentIndex]) {
+        checklist[currentIndex].status = 'partial'
+        checklist[currentIndex].bytes = received
+      }
       if (manifest) {
-        if (checklist[currentIndex]) {
-          checklist[currentIndex].status = 'partial'
-          checklist[currentIndex].bytes = received
-        }
         progress.push({
           fileIndex: currentIndex,
           filePath: currentPath,
@@ -698,8 +701,8 @@ export async function receiveFolder(options: {
           filesTotal: checklist.length,
         })
       }
-      if (pendingEnd && (currentSize === 0 || received >= currentSize)) {
-        await finishCurrentFile(pendingEnd.sha256)
+      if (pendingEnd && pendingEnd.index === currentIndex && received >= currentSize) {
+        await finishCurrentFile()
       }
     })
   }
@@ -791,48 +794,61 @@ export async function receiveFolder(options: {
         }
         if (msg.type === 'file-start') {
           await gate.waitIfPaused()
-          try {
-            await runExclusive(async () => {
-              if (io.writable) {
-                const old = io.writable
+          await runExclusive(async () => {
+            if (fileReady && io.writable) {
+              const finished = await finishCurrentFile()
+              if (!finished) {
+                try {
+                  await writeQueue
+                } catch {
+                  // ignore
+                }
+                try {
+                  await io.writable.close()
+                } catch {
+                  // ignore
+                }
                 io.writable = null
-                void old.close().catch(() => {})
+                fileReady = false
               }
-              if (!manifest) return
-              currentIndex = msg.index
-              currentPath = msg.path
-              currentSize = msg.size
-              received = msg.offset
-              io.hasher = manifest.verifyChecksums ? await createHasher() : null
-              io.writable = await openWritable(dest, msg.path, msg.offset)
-              writeQueue = Promise.resolve()
-              outstanding = 0
-              for (const chunk of earlyChunks.splice(0).sort((a, b) => a.offset - b.offset)) {
-                io.hasher?.update(chunk.payload)
-                enqueueWrite(chunk.offset, chunk.payload)
-              }
-            })
-          } catch {
-            try {
-              sendControl(channel, { type: 'file-ack', index: msg.index })
-            } catch {
-              // keep going
             }
-          }
+            try {
+              await writeQueue
+            } catch {
+              // ignore
+            }
+            if (!manifest) return
+            currentIndex = msg.index
+            currentPath = msg.path
+            currentSize = msg.size
+            received = msg.offset
+            pendingEnd = null
+            io.hasher = manifest.verifyChecksums ? await createHasher() : null
+            io.writable = await openWritable(dest, msg.path, msg.offset)
+            fileReady = true
+            writeQueue = Promise.resolve()
+            outstanding = 0
+            const later: typeof earlyChunks = []
+            for (const chunk of earlyChunks.splice(0).sort((a, b) => a.offset - b.offset)) {
+              if (chunk.index !== currentIndex) {
+                if (chunk.index > currentIndex) later.push(chunk)
+                continue
+              }
+              io.hasher?.update(chunk.payload)
+              enqueueWrite(chunk.offset, chunk.payload)
+              received += chunk.payload.byteLength
+              bytesDone += chunk.payload.byteLength
+            }
+            earlyChunks.push(...later)
+          })
         }
         if (msg.type === 'file-end') {
           pendingEnd = { index: msg.index, sha256: msg.sha256 }
-          try {
-            await runExclusive(async () => {
-              await finishCurrentFile(msg.sha256)
-            })
-          } catch {
-            try {
-              sendControl(channel, { type: 'file-ack', index: msg.index })
-            } catch {
-              // keep going
+          await runExclusive(async () => {
+            if (pendingEnd && pendingEnd.index === currentIndex) {
+              await finishCurrentFile()
             }
-          }
+          })
         }
         if (msg.type === 'done') {
           await writeQueue.catch(() => {})
