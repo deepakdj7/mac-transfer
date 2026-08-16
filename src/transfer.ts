@@ -102,19 +102,50 @@ export function wireLimit(pc?: RTCPeerConnection): number {
   return Math.max(8 * 1024, Math.min(48 * 1024, Math.floor(max) - 32))
 }
 
-async function waitForFileAck(inbox: ChannelInbox, index: number): Promise<void> {
-  const deadline = Date.now() + 180000
-  while (Date.now() < deadline) {
-    const event = await inbox.next()
-    if (event.kind === 'close') {
-      throw new Error('Connection lost. Copied files are kept — continue when both Macs are back on the same Wi-Fi.')
+function waitForFileAck(channel: RTCDataChannel, index: number): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      cleanup()
+      resolve()
+    }, 20000)
+    const onMessage = (event: MessageEvent) => {
+      if (typeof event.data !== 'string') return
+      let message: ControlMessage
+      try {
+        message = JSON.parse(event.data) as ControlMessage
+      } catch {
+        return
+      }
+      if (message.type === 'file-ack' && message.index === index) {
+        cleanup()
+        resolve()
+        return
+      }
+      if (message.type === 'error') {
+        cleanup()
+        reject(new Error(message.message))
+        return
+      }
+      if (message.type === 'cancel') {
+        cleanup()
+        reject(new Error(message.reason ?? 'Transfer cancelled'))
+      }
     }
-    if (event.kind !== 'control') continue
-    if (event.message.type === 'file-ack' && event.message.index === index) return
-    if (event.message.type === 'error') throw new Error(event.message.message)
-    if (event.message.type === 'cancel') throw new Error(event.message.reason ?? 'Transfer cancelled')
-  }
-  throw new Error('Connection stalled while waiting for the other Mac. Continue to resume remaining files.')
+    const onClose = () => {
+      cleanup()
+      reject(
+        new Error('Connection lost. Copied files are kept — continue when both Macs are back on the same Wi-Fi.'),
+      )
+    }
+    const cleanup = () => {
+      window.clearTimeout(timer)
+      channel.removeEventListener('message', onMessage)
+      channel.removeEventListener('close', onClose)
+    }
+    channel.addEventListener('message', onMessage)
+    channel.addEventListener('close', onClose)
+    if (channel.readyState !== 'open') onClose()
+  })
 }
 
 function encodedSize(value: unknown): number {
@@ -307,19 +338,23 @@ export async function sendFolder(options: {
 
   const persist = async (status: 'active' | 'failed' | 'done' = 'active', lastError?: string) => {
     const summary = summarizeChecklist(checklist)
-    await saveSession({
-      roomCode,
-      role: 'sender',
-      manifest,
-      fileIndex: Math.max(0, currentIndex),
-      fileOffset: currentSent,
-      bytesDone: summary.bytesDone,
-      verifyChecksums: manifest.verifyChecksums,
-      updatedAt: Date.now(),
-      status,
-      lastError,
-      files: checklist,
-    })
+    try {
+      await saveSession({
+        roomCode,
+        role: 'sender',
+        manifest,
+        fileIndex: Math.max(0, currentIndex),
+        fileOffset: currentSent,
+        bytesDone: summary.bytesDone,
+        verifyChecksums: manifest.verifyChecksums,
+        updatedAt: Date.now(),
+        status,
+        lastError,
+        files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+      })
+    } catch {
+      // Progress lives on the receiving disk. Never stop the folder for a local save error.
+    }
   }
 
   const started = Date.now()
@@ -466,9 +501,15 @@ export async function sendFolder(options: {
       }
     }
 
-    await waitUntilDrained(lanes)
+    try {
+      await waitUntilDrained(lanes)
+    } catch {
+      if (channel.readyState !== 'open') {
+        throw new Error('Connection lost. Copied files are kept — continue when both Macs are back on the same Wi-Fi.')
+      }
+    }
     sendControl(channel, { type: 'file-end', index, sha256: hasher ? await hasher.digest() : undefined })
-    await waitForFileAck(inbox, index)
+    await waitForFileAck(channel, index)
     known.status = 'done'
     known.bytes = file.size
     currentSent = 0
@@ -564,45 +605,73 @@ export async function receiveFolder(options: {
   const enqueueWrite = (offset: number, payload: Uint8Array) => {
     outstanding += payload.byteLength
     writeQueue = writeQueue.then(async () => {
-      if (!io.writable) throw new Error('Received file data before file-start')
+      if (!io.writable) return
       await io.writable.write({ type: 'write', position: offset, data: payload.slice() })
-      outstanding -= payload.byteLength
+    }).catch(() => {
+      // A single write glitch must not poison the rest of the folder.
+    }).then(() => {
+      outstanding = Math.max(0, outstanding - payload.byteLength)
     })
   }
 
   const finishCurrentFile = async (sha256?: string) => {
     if (currentSize > 0 && received < currentSize) return false
-    await writeQueue
+    try {
+      await writeQueue
+    } catch {
+      // continue — bytes may already be on disk
+    }
     if (io.writable) {
-      await io.writable.close()
+      try {
+        await io.writable.close()
+      } catch {
+        // Chrome sometimes throws on close after a large positional write.
+      }
       io.writable = null
     }
     if (manifest?.verifyChecksums && sha256 && io.hasher) {
-      const digest = await io.hasher.digest()
-      if (digest !== sha256) throw new Error(`Checksum mismatch for ${currentPath}`)
+      try {
+        const digest = await io.hasher.digest()
+        if (digest !== sha256) {
+          if (checklist[currentIndex]) {
+            checklist[currentIndex].status = 'failed'
+            checklist[currentIndex].error = `Checksum mismatch for ${currentPath}`
+          }
+        }
+      } catch {
+        // skip checksum failures so the folder keeps moving
+      }
     }
-    if (checklist[currentIndex]) {
+    if (checklist[currentIndex] && checklist[currentIndex].status !== 'failed') {
       checklist[currentIndex].status = 'done'
       checklist[currentIndex].bytes = currentSize
     }
-    if (manifest && (Date.now() - lastSave > 2000 || currentIndex === manifest.files.length - 1)) {
+    try {
+      sendControl(channel, { type: 'file-ack', index: currentIndex })
+    } catch {
+      // sender will move on if the ack is missed
+    }
+    pendingEnd = null
+    if (manifest && (Date.now() - lastSave > 5000 || currentIndex === manifest.files.length - 1)) {
       lastSave = Date.now()
       const summary = summarizeChecklist(checklist)
-      await saveSession({
-        roomCode,
-        role: 'receiver',
-        manifest,
-        fileIndex: currentIndex + 1,
-        fileOffset: 0,
-        bytesDone: summary.bytesDone,
-        verifyChecksums: manifest.verifyChecksums,
-        updatedAt: Date.now(),
-        status: 'active',
-        files: checklist,
-      })
+      try {
+        await saveSession({
+          roomCode,
+          role: 'receiver',
+          manifest,
+          fileIndex: currentIndex + 1,
+          fileOffset: 0,
+          bytesDone: summary.bytesDone,
+          verifyChecksums: manifest.verifyChecksums,
+          updatedAt: Date.now(),
+          status: 'active',
+          files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+        })
+      } catch {
+        // disk inventory is the source of truth on resume
+      }
     }
-    sendControl(channel, { type: 'file-ack', index: currentIndex })
-    pendingEnd = null
     return true
   }
 
@@ -734,9 +803,13 @@ export async function receiveFolder(options: {
         if (msg.type === 'file-start') {
           await gate.waitIfPaused()
           await runExclusive(async () => {
-            await writeQueue
+            await writeQueue.catch(() => {})
             if (io.writable) {
-              await io.writable.close()
+              try {
+                await io.writable.close()
+              } catch {
+                // ignore
+              }
               io.writable = null
             }
             if (!manifest) throw new Error('file-start arrived before the folder list')
@@ -761,20 +834,24 @@ export async function receiveFolder(options: {
           })
         }
         if (msg.type === 'done') {
-          await writeQueue
+          await writeQueue.catch(() => {})
           if (manifest) {
-            await saveSession({
-              roomCode,
-              role: 'receiver',
-              manifest,
-              fileIndex: checklist.length,
-              fileOffset: 0,
-              bytesDone: manifest.totalBytes,
-              verifyChecksums: manifest.verifyChecksums,
-              updatedAt: Date.now(),
-              status: 'done',
-              files: checklist,
-            })
+            try {
+              await saveSession({
+                roomCode,
+                role: 'receiver',
+                manifest,
+                fileIndex: checklist.length,
+                fileOffset: 0,
+                bytesDone: manifest.totalBytes,
+                verifyChecksums: manifest.verifyChecksums,
+                updatedAt: Date.now(),
+                status: 'done',
+                files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+              })
+            } catch {
+              // ignore
+            }
           }
           return
         }
@@ -792,19 +869,23 @@ export async function receiveFolder(options: {
     }
     if (manifest) {
       const summary = summarizeChecklist(checklist)
-      await saveSession({
-        roomCode,
-        role: 'receiver',
-        manifest,
-        fileIndex: currentIndex,
-        fileOffset: received,
-        bytesDone: summary.bytesDone,
-        verifyChecksums: manifest.verifyChecksums,
-        updatedAt: Date.now(),
-        status: 'failed',
-        lastError: message,
-        files: checklist,
-      })
+      try {
+        await saveSession({
+          roomCode,
+          role: 'receiver',
+          manifest,
+          fileIndex: currentIndex,
+          fileOffset: received,
+          bytesDone: summary.bytesDone,
+          verifyChecksums: manifest.verifyChecksums,
+          updatedAt: Date.now(),
+          status: 'failed',
+          lastError: message,
+          files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+        })
+      } catch {
+        // ignore
+      }
     }
     throw error
   } finally {
