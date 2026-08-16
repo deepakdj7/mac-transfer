@@ -1,6 +1,16 @@
-import { applyInventory, destBytesFor, emptyChecklist, summarizeChecklist } from './checklist.ts'
-import { createHasher } from './hash.ts'
-import { inventoryFolder, openWritable, type ScannedFile } from './fs.ts'
+import {
+  addByteSpan,
+  applyInventory,
+  contiguousEnd,
+  coveredBytes,
+  destBytesFor,
+  emptyChecklist,
+  leftoverFiles,
+  summarizeChecklist,
+  type ByteSpan,
+} from './checklist.ts'
+import { createHasher, hashBlob } from './hash.ts'
+import { getFileSize, inventoryFolder, openWritable, readDestFile, type ScannedFile } from './fs.ts'
 import { saveSession } from './idb.ts'
 import {
   BUFFER_HIGH,
@@ -102,7 +112,19 @@ export function wireLimit(pc?: RTCPeerConnection): number {
   return Math.max(8 * 1024, Math.min(48 * 1024, Math.floor(max) - 32))
 }
 
-function waitForFileAck(channel: RTCDataChannel, index: number): Promise<void> {
+class FileNackError extends Error {
+  offset: number
+  constructor(offset: number, reason: string) {
+    super(reason)
+    this.offset = offset
+  }
+}
+
+function waitForFileControl(
+  channel: RTCDataChannel,
+  index: number,
+  accept: ReadonlySet<ControlMessage['type']>,
+): Promise<ControlMessage> {
   return new Promise((resolve, reject) => {
     const onMessage = (event: MessageEvent) => {
       if (typeof event.data !== 'string') return
@@ -112,9 +134,14 @@ function waitForFileAck(channel: RTCDataChannel, index: number): Promise<void> {
       } catch {
         return
       }
-      if (message.type === 'file-ack' && message.index === index) {
+      if (message.type === 'file-nack' && message.index === index) {
         cleanup()
-        resolve()
+        reject(new FileNackError(message.offset, message.reason))
+        return
+      }
+      if (accept.has(message.type) && 'index' in message && message.index === index) {
+        cleanup()
+        resolve(message)
         return
       }
       if (message.type === 'error') {
@@ -139,6 +166,18 @@ function waitForFileAck(channel: RTCDataChannel, index: number): Promise<void> {
     channel.addEventListener('close', onClose)
     if (channel.readyState !== 'open') onClose()
   })
+}
+
+function waitForFileReady(channel: RTCDataChannel, index: number): Promise<{ offset: number; done: boolean }> {
+  return waitForFileControl(channel, index, new Set(['file-ready', 'file-ack'])).then((message) => {
+    if (message.type === 'file-ack') return { offset: Number.POSITIVE_INFINITY, done: true }
+    if (message.type === 'file-ready') return { offset: message.offset, done: false }
+    throw new Error('Unexpected file handshake')
+  })
+}
+
+function waitForFileAck(channel: RTCDataChannel, index: number): Promise<void> {
+  return waitForFileControl(channel, index, new Set(['file-ack'])).then(() => undefined)
 }
 
 function encodedSize(value: unknown): number {
@@ -331,7 +370,7 @@ export async function sendFolder(options: {
 }): Promise<void> {
   const { channel, inbox, roomCode, files, manifest, gate, onProgress } = options
   const limit = wireLimit(options.pc)
-  const chunkSize = Math.min(CHUNK_SIZE, limit - 8)
+  const chunkSize = Math.min(CHUNK_SIZE, limit - 12)
   const lanes =
     manifest.verifyChecksums || options.dataChannels.length === 0
       ? [options.dataChannels[0] ?? channel]
@@ -357,7 +396,7 @@ export async function sendFolder(options: {
         updatedAt: Date.now(),
         status,
         lastError,
-        files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+        files: leftoverFiles(checklist),
       })
     } catch {
       // Progress lives on the receiving disk. Never stop the folder for a local save error.
@@ -387,15 +426,16 @@ export async function sendFolder(options: {
       count: manifest.files.length,
     },
     (batch) => ({ type: 'manifest-part', files: batch }),
-    { type: 'manifest-end' },
+    { type: 'manifest-end', count: manifest.files.length },
     manifest.files,
   )
 
   let inventory: Array<{ path: string; bytes: number }> | undefined
   const inventoryParts: Array<{ path: string; bytes: number }> = []
-  const inventoryDeadline = Date.now() + 120000
+  let inventoryCount = -1
+  const inventoryDeadline = Date.now() + 10 * 60 * 1000
   while (!inventory) {
-    if (Date.now() > inventoryDeadline) throw new Error('Receiver did not report which files are already copied')
+    if (Date.now() > inventoryDeadline) throw new Error('Receiver did not finish checking every file')
     const event = await inbox.next()
     if (event.kind === 'close') throw new Error('Connection closed while waiting for the file list')
     if (event.kind !== 'control') continue
@@ -405,11 +445,23 @@ export async function sendFolder(options: {
     }
     if (event.message.type === 'inventory-start') {
       inventoryParts.length = 0
+      inventoryCount = event.message.count
     }
     if (event.message.type === 'inventory-part') {
       inventoryParts.push(...event.message.files)
     }
     if (event.message.type === 'inventory-end') {
+      const expected = event.message.count ?? inventoryCount
+      if (expected < 0 || inventoryParts.length !== expected) {
+        throw new Error(
+          `File check was incomplete (${inventoryParts.length} of ${expected} files). Reconnect so every file is checked again.`,
+        )
+      }
+      if (expected !== manifest.files.length) {
+        throw new Error(
+          `File check missed files (${expected} reported, ${manifest.files.length} in the folder). Reconnect and try again.`,
+        )
+      }
       inventory = inventoryParts
       break
     }
@@ -444,87 +496,119 @@ export async function sendFolder(options: {
       bytes: 0,
     }
     checklist[index] = known
-    try {
     await gate.waitIfPaused()
-    const offset = destBytesFor(known)
-    if (known.status === 'done') continue
-    if (file.size > 0 && offset >= file.size) {
-      known.status = 'done'
-      known.bytes = file.size
-      continue
-    }
+    if (known.status === 'done' && known.bytes === file.size) continue
+
     currentIndex = index
-    currentSent = offset
-    known.status = offset > 0 ? 'partial' : 'pending'
-    known.bytes = offset
-    sendControl(channel, { type: 'file-start', index, path: file.path, size: file.size, offset })
-
-    const blob = await file.handle.getFile()
-    const hasher = manifest.verifyChecksums ? await createHasher() : null
-    let sent = offset
-
-    if (offset > 0 && hasher) {
-      const prefix = blob.slice(0, offset)
-      const reader = prefix.stream().getReader()
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-        if (value) hasher.update(value)
-      }
-    }
-
-    let pos = offset
-    let nextRead = pos < blob.size ? blob.slice(pos, Math.min(pos + READ_AHEAD, blob.size)).arrayBuffer() : null
-
-    while (nextRead) {
-      await gate.waitIfPaused()
-      const block = await nextRead
-      pos += block.byteLength
-      nextRead = pos < blob.size ? blob.slice(pos, Math.min(pos + READ_AHEAD, blob.size)).arrayBuffer() : null
-      hasher?.update(new Uint8Array(block))
-
-      for (let inner = 0; inner < block.byteLength; inner += chunkSize) {
+    let copied = false
+    let attempt = 0
+    while (!copied) {
+      attempt += 1
+      try {
         await gate.waitIfPaused()
-        const lane = pickChannel(lanes)
-        await waitForBuffer(lane)
-        const piece = block.slice(inner, Math.min(inner + chunkSize, block.byteLength))
-        const fileOffset = sent
-        lane.send(encodeChunk(index, fileOffset, piece))
-        sent += piece.byteLength
-        bytesDone += piece.byteLength
-        currentSent = sent
-        known.bytes = sent
-        known.status = 'partial'
-        progress.push({
-          fileIndex: index,
-          filePath: file.path,
-          fileBytes: sent,
-          fileSize: file.size,
-          bytesDone,
-          totalBytes: manifest.totalBytes,
-          speed: speed.push(piece.byteLength),
-          filesDone: summarizeChecklist(checklist).done,
-          filesTotal: checklist.length,
-        })
+        const hinted = destBytesFor(known)
+        currentSent = hinted
+        known.status = hinted > 0 && hinted < file.size ? 'partial' : 'pending'
+        known.bytes = hinted
+        sendControl(channel, { type: 'file-start', index, path: file.path, size: file.size, offset: hinted })
+        const ready = await waitForFileReady(channel, index)
+        if (ready.done || ready.offset >= file.size) {
+          known.status = 'done'
+          known.bytes = file.size
+          known.error = undefined
+          copied = true
+          break
+        }
+
+        const offset = Math.max(0, Math.min(ready.offset, file.size))
+        const blob = await file.handle.getFile()
+        if (blob.size !== file.size) {
+          throw new Error(`${file.path} changed size while sending. Scan the folder again.`)
+        }
+        const hasher = manifest.verifyChecksums ? await createHasher() : null
+        let sent = offset
+        currentSent = offset
+
+        if (offset > 0 && hasher) {
+          const prefix = blob.slice(0, offset)
+          const reader = prefix.stream().getReader()
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            if (value) hasher.update(value)
+          }
+        }
+
+        let pos = offset
+        let nextRead = pos < blob.size ? blob.slice(pos, Math.min(pos + READ_AHEAD, blob.size)).arrayBuffer() : null
+
+        while (nextRead) {
+          await gate.waitIfPaused()
+          const block = await nextRead
+          pos += block.byteLength
+          nextRead = pos < blob.size ? blob.slice(pos, Math.min(pos + READ_AHEAD, blob.size)).arrayBuffer() : null
+          hasher?.update(new Uint8Array(block))
+
+          for (let inner = 0; inner < block.byteLength; inner += chunkSize) {
+            await gate.waitIfPaused()
+            const lane = pickChannel(lanes)
+            await waitForBuffer(lane)
+            const piece = block.slice(inner, Math.min(inner + chunkSize, block.byteLength))
+            const fileOffset = sent
+            lane.send(encodeChunk(index, fileOffset, piece))
+            sent += piece.byteLength
+            bytesDone += piece.byteLength
+            currentSent = sent
+            known.bytes = sent
+            known.status = 'partial'
+            progress.push({
+              fileIndex: index,
+              filePath: file.path,
+              fileBytes: sent,
+              fileSize: file.size,
+              bytesDone,
+              totalBytes: manifest.totalBytes,
+              speed: speed.push(piece.byteLength),
+              filesDone: summarizeChecklist(checklist).done,
+              filesTotal: checklist.length,
+            })
+          }
+        }
+
+        try {
+          await waitUntilDrained(lanes)
+        } catch {
+          if (!linkAlive(channel, options.pc)) throw connectionLost()
+        }
+        sendControl(channel, { type: 'file-end', index, sha256: hasher ? await hasher.digest() : undefined })
+        await waitForFileAck(channel, index)
+        copied = true
+      } catch (error) {
+        if (!linkAlive(channel, options.pc)) throw connectionLost()
+        const message = error instanceof Error ? error.message : 'File failed'
+        if (message.startsWith('Connection lost') || message === 'Transfer cancelled') throw error
+        known.status = currentSent > 0 ? 'partial' : 'failed'
+        known.bytes = currentSent
+        known.error = message
+        if (error instanceof FileNackError) known.bytes = error.offset
+        await persist('active', known.error)
+        if (attempt >= 8) {
+          throw new Error(`Could not finish ${file.path} after ${attempt} tries. ${message}`)
+        }
+        await new Promise((resolve) => window.setTimeout(resolve, Math.min(4000, 400 * attempt)))
       }
     }
 
-    try {
-      await waitUntilDrained(lanes)
-    } catch {
-      if (!linkAlive(channel, options.pc)) throw connectionLost()
-    }
-    sendControl(channel, { type: 'file-end', index, sha256: hasher ? await hasher.digest() : undefined })
-    await waitForFileAck(channel, index)
     known.status = 'done'
     known.bytes = file.size
+    known.error = undefined
     currentSent = 0
     const summary = summarizeChecklist(checklist)
     progress.push(
       {
         fileIndex: index,
         filePath: file.path,
-        fileBytes: sent,
+        fileBytes: file.size,
         fileSize: file.size,
         bytesDone,
         totalBytes: manifest.totalBytes,
@@ -538,15 +622,6 @@ export async function sendFolder(options: {
     if (Date.now() - lastSave > 2000 || index === files.length - 1) {
       lastSave = Date.now()
       await persist('active')
-    }
-    } catch (error) {
-      if (!linkAlive(channel, options.pc)) throw connectionLost()
-      const message = error instanceof Error ? error.message : 'File failed'
-      if (message.startsWith('Connection lost') || message === 'Transfer cancelled') throw error
-      known.status = currentSent > 0 ? 'partial' : 'failed'
-      known.bytes = currentSent
-      known.error = message
-      await persist('active', known.error)
     }
   }
 
@@ -594,11 +669,11 @@ export async function receiveFolder(options: {
 
   const io = {
     writable: null as FileSystemWritableFileStream | null,
-    hasher: null as Awaited<ReturnType<typeof createHasher>> | null,
   }
   let manifest: Manifest | null = null
   let manifestParts: Manifest['files'] = []
   let pendingManifest: Omit<Manifest, 'files'> | null = null
+  let manifestCount = -1
   let currentIndex = -1
   let currentPath = ''
   let currentSize = 0
@@ -610,6 +685,8 @@ export async function receiveFolder(options: {
   let outstanding = 0
   let lastSave = 0
   let pendingEnd: { index: number; sha256?: string } | null = null
+  let spans: ByteSpan[] = []
+  let holeTimer = 0
   const earlyChunks: Array<{ index: number; offset: number; payload: Uint8Array }> = []
 
   const runExclusive = (fn: () => Promise<void>) => {
@@ -627,6 +704,68 @@ export async function receiveFolder(options: {
     })
   }
 
+  const clearHoleTimer = () => {
+    if (holeTimer) {
+      window.clearTimeout(holeTimer)
+      holeTimer = 0
+    }
+  }
+
+  const nackIncomplete = (reason: string, offset = contiguousEnd(spans, 0)) => {
+    pendingEnd = null
+    try {
+      sendControl(channel, { type: 'file-nack', index: currentIndex, offset, reason })
+    } catch {
+      // connection may already be down
+    }
+  }
+
+  const abandonCurrent = async () => {
+    clearHoleTimer()
+    try {
+      await writeQueue
+    } catch {
+      // ignore
+    }
+    if (io.writable) {
+      try {
+        await io.writable.close()
+      } catch {
+        // ignore
+      }
+      io.writable = null
+    }
+    fileReady = false
+  }
+
+  const scheduleHoleCheck = () => {
+    clearHoleTimer()
+    holeTimer = window.setTimeout(() => {
+      void runExclusive(async () => {
+        if (!pendingEnd || pendingEnd.index !== currentIndex || !fileReady) return
+        if (contiguousEnd(spans, 0) >= currentSize) {
+          await finishCurrentFile()
+          return
+        }
+        await abandonCurrent()
+        nackIncomplete('Missing bytes after the file was sent')
+      })
+    }, 8000)
+  }
+
+  const absorbChunk = (chunk: { offset: number; payload: Uint8Array }) => {
+    const before = coveredBytes(spans, 0, currentSize)
+    spans = addByteSpan(spans, chunk.offset, chunk.offset + chunk.payload.byteLength)
+    const after = coveredBytes(spans, 0, currentSize)
+    received = after
+    bytesDone += after - before
+    enqueueWrite(chunk.offset, chunk.payload)
+    if (checklist[currentIndex]) {
+      checklist[currentIndex].status = 'partial'
+      checklist[currentIndex].bytes = received
+    }
+  }
+
   const persistProgress = (status: 'active' | 'failed' | 'done' = 'active') => {
     if (!manifest) return
     lastSave = Date.now()
@@ -641,24 +780,43 @@ export async function receiveFolder(options: {
       verifyChecksums: manifest.verifyChecksums,
       updatedAt: Date.now(),
       status,
-      files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+      files: leftoverFiles(checklist),
     }).catch(() => {})
   }
 
   const finishCurrentFile = async () => {
     if (!fileReady || !io.writable) return false
-    if (currentSize > 0 && received < currentSize) return false
+    if (currentSize > 0 && contiguousEnd(spans, 0) < currentSize) return false
+    clearHoleTimer()
     await writeQueue
     const old = io.writable
     io.writable = null
     fileReady = false
     if (old) await old.close()
+    const onDisk = await getFileSize(dest, currentPath)
+    if (onDisk !== currentSize) {
+      nackIncomplete(`Saved size was ${onDisk}, expected ${currentSize}`, onDisk)
+      return false
+    }
+    if (manifest?.verifyChecksums && pendingEnd?.sha256) {
+      const saved = await readDestFile(dest, currentPath)
+      if (!saved) {
+        nackIncomplete('Could not re-read the saved file', 0)
+        return false
+      }
+      const digest = await hashBlob(saved)
+      if (digest !== pendingEnd.sha256) {
+        nackIncomplete(`Checksum mismatch for ${currentPath}`, 0)
+        return false
+      }
+    }
     if (checklist[currentIndex]) {
       checklist[currentIndex].status = 'done'
       checklist[currentIndex].bytes = currentSize
     }
     sendControl(channel, { type: 'file-ack', index: currentIndex })
     pendingEnd = null
+    spans = []
     if (manifest && (Date.now() - lastSave > 8000 || currentIndex === manifest.files.length - 1)) {
       persistProgress('active')
     }
@@ -680,14 +838,7 @@ export async function receiveFolder(options: {
       while (outstanding > WRITE_BACKPRESSURE) {
         await writeQueue
       }
-      io.hasher?.update(chunk.payload)
-      enqueueWrite(chunk.offset, chunk.payload)
-      received += chunk.payload.byteLength
-      bytesDone += chunk.payload.byteLength
-      if (checklist[currentIndex]) {
-        checklist[currentIndex].status = 'partial'
-        checklist[currentIndex].bytes = received
-      }
+      absorbChunk(chunk)
       if (manifest) {
         progress.push({
           fileIndex: currentIndex,
@@ -701,8 +852,10 @@ export async function receiveFolder(options: {
           filesTotal: checklist.length,
         })
       }
-      if (pendingEnd && pendingEnd.index === currentIndex && received >= currentSize) {
+      if (pendingEnd && pendingEnd.index === currentIndex && contiguousEnd(spans, 0) >= currentSize) {
         await finishCurrentFile()
+      } else if (pendingEnd && pendingEnd.index === currentIndex) {
+        scheduleHoleCheck()
       }
     })
   }
@@ -742,6 +895,7 @@ export async function receiveFolder(options: {
             totalBytes: msg.totalBytes,
             verifyChecksums: msg.verifyChecksums,
           }
+          manifestCount = msg.count
           manifestParts = []
         }
         if (msg.type === 'manifest-part') {
@@ -752,6 +906,12 @@ export async function receiveFolder(options: {
           if (msg.type === 'manifest') {
             manifest = msg.manifest
           } else if (pendingManifest) {
+            const expected = msg.count ?? manifestCount
+            if (expected >= 0 && manifestParts.length !== expected) {
+              throw new Error(
+                `Folder list was incomplete (${manifestParts.length} of ${expected} files). Reconnect so every file is checked.`,
+              )
+            }
             manifest = { ...pendingManifest, files: manifestParts }
           } else {
             throw new Error('Folder list arrived in the wrong order')
@@ -771,7 +931,7 @@ export async function receiveFolder(options: {
             limit,
             { type: 'inventory-start', count: report.length },
             (batch) => ({ type: 'inventory-part', files: batch }),
-            { type: 'inventory-end' },
+            { type: 'inventory-end', count: report.length },
             report,
           )
           progress.push(
@@ -797,57 +957,64 @@ export async function receiveFolder(options: {
           await runExclusive(async () => {
             if (fileReady && io.writable) {
               const finished = await finishCurrentFile()
-              if (!finished) {
-                try {
-                  await writeQueue
-                } catch {
-                  // ignore
-                }
-                try {
-                  await io.writable.close()
-                } catch {
-                  // ignore
-                }
-                io.writable = null
-                fileReady = false
-              }
-            }
-            try {
-              await writeQueue
-            } catch {
-              // ignore
+              if (!finished) await abandonCurrent()
+            } else {
+              await abandonCurrent()
             }
             if (!manifest) return
             currentIndex = msg.index
             currentPath = msg.path
             currentSize = msg.size
-            received = msg.offset
             pendingEnd = null
-            io.hasher = manifest.verifyChecksums ? await createHasher() : null
-            io.writable = await openWritable(dest, msg.path, msg.offset)
-            fileReady = true
-            writeQueue = Promise.resolve()
-            outstanding = 0
-            const later: typeof earlyChunks = []
-            for (const chunk of earlyChunks.splice(0).sort((a, b) => a.offset - b.offset)) {
-              if (chunk.index !== currentIndex) {
-                if (chunk.index > currentIndex) later.push(chunk)
-                continue
+            spans = []
+            const onDisk = await getFileSize(dest, msg.path)
+            if (currentSize === 0 || onDisk === currentSize) {
+              if (currentSize === 0) {
+                const blank = await openWritable(dest, msg.path, 0)
+                await blank.close()
               }
-              io.hasher?.update(chunk.payload)
-              enqueueWrite(chunk.offset, chunk.payload)
-              received += chunk.payload.byteLength
-              bytesDone += chunk.payload.byteLength
+              received = currentSize
+              if (checklist[currentIndex]) {
+                checklist[currentIndex].status = 'done'
+                checklist[currentIndex].bytes = currentSize
+              }
+              sendControl(channel, { type: 'file-ack', index: currentIndex })
+              return
             }
-            earlyChunks.push(...later)
+            const offset = onDisk > currentSize ? 0 : onDisk
+            spans = offset > 0 ? [{ start: 0, end: offset }] : []
+            received = offset
+            try {
+              io.writable = await openWritable(dest, msg.path, offset)
+              fileReady = true
+              writeQueue = Promise.resolve()
+              outstanding = 0
+              const later: typeof earlyChunks = []
+              for (const chunk of earlyChunks.splice(0).sort((a, b) => a.offset - b.offset)) {
+                if (chunk.index !== currentIndex) {
+                  if (chunk.index > currentIndex) later.push(chunk)
+                  continue
+                }
+                absorbChunk(chunk)
+              }
+              earlyChunks.push(...later)
+              sendControl(channel, { type: 'file-ready', index: currentIndex, offset })
+            } catch (error) {
+              await abandonCurrent()
+              const message = error instanceof Error ? error.message : 'Could not open the destination file'
+              nackIncomplete(message, offset)
+            }
           })
         }
         if (msg.type === 'file-end') {
           pendingEnd = { index: msg.index, sha256: msg.sha256 }
           await runExclusive(async () => {
-            if (pendingEnd && pendingEnd.index === currentIndex) {
+            if (!pendingEnd || pendingEnd.index !== currentIndex) return
+            if (contiguousEnd(spans, 0) >= currentSize) {
               await finishCurrentFile()
+              return
             }
+            scheduleHoleCheck()
           })
         }
         if (msg.type === 'done') {
@@ -864,7 +1031,7 @@ export async function receiveFolder(options: {
                 verifyChecksums: manifest.verifyChecksums,
                 updatedAt: Date.now(),
                 status: 'done',
-                files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+                files: leftoverFiles(checklist),
               })
             } catch {
               // ignore
@@ -898,7 +1065,7 @@ export async function receiveFolder(options: {
           updatedAt: Date.now(),
           status: 'failed',
           lastError: message,
-          files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+          files: leftoverFiles(checklist),
         })
       } catch {
         // ignore
@@ -907,6 +1074,7 @@ export async function receiveFolder(options: {
     throw error
   } finally {
     window.clearInterval(retry)
+    clearHoleTimer()
     for (const lane of lanes) {
       lane.removeEventListener('message', onLaneMessage)
     }

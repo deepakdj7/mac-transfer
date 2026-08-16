@@ -26,10 +26,12 @@ export type ControlMessage =
   | { type: 'manifest'; manifest: Manifest }
   | { type: 'manifest-start'; folderName: string; totalBytes: number; verifyChecksums: boolean; count: number }
   | { type: 'manifest-part'; files: FileEntry[] }
-  | { type: 'manifest-end' }
+  | { type: 'manifest-end'; count?: number }
   | { type: 'file-start'; index: number; path: string; size: number; offset: number }
   | { type: 'file-end'; index: number; sha256?: string }
+  | { type: 'file-ready'; index: number; offset: number }
   | { type: 'file-ack'; index: number }
+  | { type: 'file-nack'; index: number; offset: number; reason: string }
   | { type: 'done' }
   | { type: 'pause' }
   | { type: 'resume' }
@@ -38,7 +40,7 @@ export type ControlMessage =
   | { type: 'inventory'; files: Array<{ path: string; bytes: number }> }
   | { type: 'inventory-start'; count: number }
   | { type: 'inventory-part'; files: Array<{ path: string; bytes: number }> }
-  | { type: 'inventory-end' }
+  | { type: 'inventory-end'; count?: number }
   | { type: 'error'; message: string }
 
 export type SignalMessage =

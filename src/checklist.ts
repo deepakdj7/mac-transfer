@@ -20,7 +20,7 @@ export function applyInventory(
     if (file.size === 0 && exists) {
       return { path: file.path, size: 0, status: 'done', bytes: 0 }
     }
-    if (file.size > 0 && bytes >= file.size) {
+    if (file.size > 0 && bytes === file.size) {
       return { path: file.path, size: file.size, status: 'done', bytes: file.size }
     }
     if (bytes > 0) {
@@ -61,8 +61,48 @@ export function summarizeChecklist(list: FileProgress[]) {
   }
 }
 
-export function remainingFiles(list: FileProgress[], limit = 250): FileProgress[] {
-  return list.filter((file) => file.status !== 'done').slice(0, limit)
+export function remainingFiles(list: FileProgress[], limit = Number.POSITIVE_INFINITY): FileProgress[] {
+  const leftover = list.filter((file) => file.status !== 'done')
+  if (!Number.isFinite(limit)) return leftover
+  return leftover.slice(0, limit)
+}
+
+export function leftoverFiles(list: FileProgress[]): FileProgress[] {
+  return list.filter((file) => file.status !== 'done')
+}
+
+export type ByteSpan = { start: number; end: number }
+
+export function addByteSpan(spans: ByteSpan[], start: number, end: number): ByteSpan[] {
+  if (end <= start) return spans
+  const next = [...spans, { start, end }].sort((a, b) => a.start - b.start)
+  const merged: ByteSpan[] = []
+  for (const span of next) {
+    const last = merged[merged.length - 1]
+    if (!last || span.start > last.end) merged.push({ start: span.start, end: span.end })
+    else last.end = Math.max(last.end, span.end)
+  }
+  return merged
+}
+
+export function contiguousEnd(spans: ByteSpan[], from = 0): number {
+  let cursor = from
+  for (const span of spans) {
+    if (span.end <= cursor) continue
+    if (span.start > cursor) break
+    cursor = span.end
+  }
+  return cursor
+}
+
+export function coveredBytes(spans: ByteSpan[], start: number, end: number): number {
+  let total = 0
+  for (const span of spans) {
+    const from = Math.max(span.start, start)
+    const to = Math.min(span.end, end)
+    if (to > from) total += to - from
+  }
+  return total
 }
 
 export function destBytesFor(file: FileProgress): number {

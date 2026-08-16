@@ -15,6 +15,7 @@ const SKIP_NAMES = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini'])
 export async function scanFolder(
   root: FileSystemDirectoryHandle,
   onProgress?: (info: ScanProgress) => void,
+  options?: { failOnUnreadable?: boolean },
 ): Promise<ScannedFile[]> {
   const files: ScannedFile[] = []
   let totalBytes = 0
@@ -27,9 +28,10 @@ export async function scanFolder(
         await walk(handle, `${prefix}${name}/`)
         continue
       }
+      const path = `${prefix}${name}`
       try {
         const file = await handle.getFile()
-        files.push({ path: `${prefix}${name}`, size: file.size, handle })
+        files.push({ path, size: file.size, handle })
         totalBytes += file.size
         visited += 1
         if (visited % 40 === 0) {
@@ -37,7 +39,9 @@ export async function scanFolder(
           await new Promise((r) => setTimeout(r, 0))
         }
       } catch {
-        // Unreadable file (permissions, broken alias). Skip it.
+        if (options?.failOnUnreadable) {
+          throw new Error(`Could not read ${path}. Fix that file and scan again so nothing is left out.`)
+        }
       }
     }
   }
@@ -66,6 +70,44 @@ export async function openWritable(
     await writable.seek(offset)
   }
   return writable
+}
+
+async function resolveFile(
+  root: FileSystemDirectoryHandle,
+  path: string,
+  create: boolean,
+): Promise<FileSystemFileHandle | null> {
+  const parts = path.split('/').filter(Boolean)
+  if (parts.length === 0) return null
+  let dir = root
+  try {
+    for (const part of parts.slice(0, -1)) {
+      dir = await dir.getDirectoryHandle(part, { create })
+    }
+    return await dir.getFileHandle(parts[parts.length - 1], { create })
+  } catch {
+    return null
+  }
+}
+
+export async function getFileSize(root: FileSystemDirectoryHandle, path: string): Promise<number> {
+  const handle = await resolveFile(root, path, false)
+  if (!handle) return 0
+  try {
+    return (await handle.getFile()).size
+  } catch {
+    return 0
+  }
+}
+
+export async function readDestFile(root: FileSystemDirectoryHandle, path: string): Promise<File | null> {
+  const handle = await resolveFile(root, path, false)
+  if (!handle) return null
+  try {
+    return await handle.getFile()
+  } catch {
+    return null
+  }
 }
 
 export async function inventoryFolder(root: FileSystemDirectoryHandle): Promise<Map<string, number>> {

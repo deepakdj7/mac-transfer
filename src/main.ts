@@ -1,7 +1,7 @@
 import './style.css'
 import { supportMessage } from './browser.ts'
 import { formatBytes, formatDuration, formatSpeed, normalizeRoomCode, randomRoomCode } from './format.ts'
-import { remainingFiles, summarizeChecklist } from './checklist.ts'
+import { leftoverFiles, summarizeChecklist } from './checklist.ts'
 import { scanFolder, summarizeScan, type ScannedFile } from './fs.ts'
 import { clearSession, ensureHandlePermission, getHandle, getSession, latestSession, saveHandle, saveSession } from './idb.ts'
 import { startPeer, type PeerConnection } from './peer.ts'
@@ -89,8 +89,8 @@ function fail(error: unknown): void {
     $('error-summary').textContent =
       `${summary.done.toLocaleString()} of ${summary.total.toLocaleString()} files are already copied · ${summary.remaining.toLocaleString()} left` +
       (summary.failed ? ` · ${summary.failed} failed` : '')
-    const leftover = remainingFiles(session.files)
-    renderFileLog($('error-remaining'), leftover, Math.max(0, summary.remaining - leftover.length))
+    const leftover = leftoverFiles(session.files)
+    renderFileLog($('error-remaining'), leftover.slice(0, 80), Math.max(0, leftover.length - 80))
     await saveSession({ ...session, status: 'failed', lastError: message, updatedAt: Date.now() })
   })()
 }
@@ -302,9 +302,13 @@ async function pickAndScan(): Promise<void> {
   sourceHandle = await window.showDirectoryPicker({ mode: 'read', id: 'mac-transfer-source' })
   show('send-scan')
   $('scan-status').textContent = `Reading “${sourceHandle.name}”…`
-  scanned = await scanFolder(sourceHandle, (info) => {
-    $('scan-status').textContent = `Found ${info.fileCount} files · ${formatBytes(info.totalBytes)}`
-  })
+  scanned = await scanFolder(
+    sourceHandle,
+    (info) => {
+      $('scan-status').textContent = `Found ${info.fileCount} files · ${formatBytes(info.totalBytes)}`
+    },
+    { failOnUnreadable: true },
+  )
   if (scanned.length === 0) {
     fail(new Error('That folder is empty, or every file was unreadable.'))
     return
@@ -347,11 +351,11 @@ async function loadResumeCard(): Promise<void> {
   $('resume-text').textContent = summary
     ? `${session.role === 'sender' ? 'Sending' : 'Receiving'} room ${session.roomCode}. ${summary.done.toLocaleString()} of ${summary.total.toLocaleString()} files already copied · ${summary.remaining.toLocaleString()} left.`
     : `${session.role === 'sender' ? 'Sending' : 'Receiving'} room ${session.roomCode} · ${formatBytes(session.bytesDone)} already moved.`
-  const leftover = session.files ? remainingFiles(session.files) : []
+  const leftover = session.files ? leftoverFiles(session.files) : []
   renderFileLog(
     $('resume-remaining'),
-    leftover,
-    summary ? Math.max(0, summary.remaining - leftover.length) : 0,
+    leftover.slice(0, 80),
+    Math.max(0, leftover.length - 80),
   )
   card.classList.remove('hidden')
   card.dataset.room = session.roomCode
@@ -370,7 +374,7 @@ async function resumeLast(): Promise<void> {
     }
     sourceHandle = handle
     show('send-scan')
-    scanned = await scanFolder(handle)
+    scanned = await scanFolder(handle, undefined, { failOnUnreadable: true })
     ;($('chk-verify') as HTMLInputElement).checked = session.verifyChecksums
     await beginSend(session.roomCode)
     return

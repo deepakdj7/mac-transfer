@@ -5,6 +5,17 @@ export type IncrementalHasher = {
   digest(): Promise<string>
 }
 
+export async function hashBlob(blob: Blob): Promise<string> {
+  const hasher = await createHasher()
+  const reader = blob.stream().getReader()
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (value) hasher.update(value)
+  }
+  return hasher.digest()
+}
+
 export async function createHasher(): Promise<IncrementalHasher> {
   const hasher = await createSHA256()
   hasher.init()
