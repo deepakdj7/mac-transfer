@@ -45,9 +45,9 @@ export type ControlMessage =
 
 export type SignalMessage =
   | { type: 'hello'; role: Role; id: string }
-  | { type: 'offer'; sdp: string }
-  | { type: 'answer'; sdp: string }
-  | { type: 'ice'; candidate: RTCIceCandidateInit }
+  | { type: 'offer'; sdp: string; sid?: string }
+  | { type: 'answer'; sdp: string; sid?: string }
+  | { type: 'ice'; candidate: RTCIceCandidateInit; sid?: string }
 
 export type TransferProgress = {
   fileIndex: number

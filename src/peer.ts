@@ -70,9 +70,12 @@ export async function startPeer(
     }
   }
 
+  const localSid = crypto.randomUUID()
+  let linkSid = role === 'sender' ? localSid : ''
+
   pc.onicecandidate = (event) => {
     if (event.candidate) {
-      signaling.publish({ type: 'ice', candidate: event.candidate.toJSON() })
+      signaling.publish({ type: 'ice', candidate: event.candidate.toJSON(), sid: linkSid || localSid })
     }
   }
 
@@ -89,13 +92,22 @@ export async function startPeer(
   })
 
   attachSignal((message) => {
+    if (message.type === 'offer' && role === 'receiver') {
+      if (message.sid) linkSid = message.sid
+      resolveOffer?.(message.sdp)
+      return
+    }
+    if ('sid' in message && message.sid && linkSid && message.sid !== linkSid) return
     if (message.type === 'ice') void addIce(message.candidate)
-    if (message.type === 'offer' && role === 'receiver') resolveOffer?.(message.sdp)
     if (message.type === 'answer' && role === 'sender') {
       void (async () => {
         if (pc.remoteDescription) return
-        await pc.setRemoteDescription({ type: 'answer', sdp: message.sdp })
-        await flushIce()
+        try {
+          await pc.setRemoteDescription({ type: 'answer', sdp: message.sdp })
+          await flushIce()
+        } catch {
+          // stale answer from a previous link
+        }
       })()
     }
   })
@@ -110,7 +122,7 @@ export async function startPeer(
     onStatus?.('Creating a direct link…')
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
-    signaling.publish({ type: 'offer', sdp: offer.sdp ?? '' })
+    signaling.publish({ type: 'offer', sdp: offer.sdp ?? '', sid: localSid })
   } else {
     channelsPromise = new Promise((resolve, reject) => {
       const found = new Map<string, RTCDataChannel>()
@@ -128,11 +140,15 @@ export async function startPeer(
     })
     onStatus?.('Waiting for sender offer…')
     const sdp = await offerPromise
-    await pc.setRemoteDescription({ type: 'offer', sdp })
+    try {
+      await pc.setRemoteDescription({ type: 'offer', sdp })
+    } catch {
+      throw new Error('Got a stale offer. Reconnecting…')
+    }
     await flushIce()
     const answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
-    signaling.publish({ type: 'answer', sdp: answer.sdp ?? '' })
+    signaling.publish({ type: 'answer', sdp: answer.sdp ?? '', sid: linkSid || localSid })
   }
 
   const opened = await Promise.race([

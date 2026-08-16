@@ -36,6 +36,7 @@ let gate: TransferGate | null = null
 let wake: WakeGuard | null = null
 let signalHandler: ((message: SignalMessage) => void) | null = null
 let lastRole: Role | null = null
+let stopAutoResume = false
 const bufferedSignals: SignalMessage[] = []
 
 function show(view: View): void {
@@ -72,7 +73,65 @@ function renderFileLog(target: HTMLElement, files: FileProgress[] | undefined, e
   }
 }
 
+function recoverableError(error: unknown): boolean {
+  if (stopAutoResume) return false
+  const message = error instanceof Error ? error.message : String(error)
+  if (
+    message === 'Transfer cancelled' ||
+    message === 'Transfer cancelled.' ||
+    message.includes('Cancelled by') ||
+    message.includes('That folder is empty') ||
+    message.includes('Could not read') ||
+    message.includes('changed size') ||
+    message.includes('A file path is too long')
+  ) {
+    return false
+  }
+  return true
+}
+
+function showReconnecting(attempt: number): void {
+  show('transfer')
+  $('transfer-file').textContent =
+    attempt <= 1
+      ? 'Connection dropped. Reconnecting on its own…'
+      : `Still reconnecting automatically… try ${attempt}`
+  $('xfer-speed').textContent = 'Reconnecting'
+  $('xfer-eta').textContent = '—'
+}
+
+async function waitForRetry(attempt: number): Promise<void> {
+  const delay = Math.min(15000, 800 * 2 ** Math.min(attempt, 4))
+  await new Promise<void>((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('online', done)
+      resolve()
+    }
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') done()
+    }
+    const timer = window.setTimeout(done, delay)
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('online', done)
+  })
+}
+
+async function closeLink(): Promise<void> {
+  peer?.close()
+  peer = null
+  signaling?.close()
+  signaling = null
+  signalHandler = null
+  bufferedSignals.length = 0
+}
+
 function fail(error: unknown): void {
+  stopAutoResume = true
   const message = error instanceof Error ? error.message : 'Something went wrong'
   $('error-body').textContent = message
   show('error')
@@ -135,23 +194,32 @@ function renderProgress(progress: TransferProgress): void {
   }
 }
 
-async function connect(nextRole: Role, code: string): Promise<void> {
+async function connect(nextRole: Role, code: string, reconnecting = false): Promise<void> {
   lastRole = nextRole
   roomCode = code
-  if (nextRole === 'receiver') {
-    show('connecting')
-    $('connect-status').textContent = 'Handshaking, then opening a direct Wi-Fi link…'
+  if (nextRole === 'receiver' || reconnecting) {
+    show(reconnecting ? 'transfer' : 'connecting')
+    const text = reconnecting
+      ? 'Reconnecting to the other Mac…'
+      : 'Handshaking, then opening a direct Wi-Fi link…'
+    $('connect-status').textContent = text
+    if (reconnecting) $('transfer-file').textContent = text
   }
 
   let releasePeer = () => {}
   const peerPresent = new Promise<void>((resolve) => {
     releasePeer = resolve
   })
+  let failConnect = (_error: Error) => {}
+  const connectionDied = new Promise<never>((_, reject) => {
+    failConnect = reject
+  })
 
   signaling = await joinSignalRoom(code, nextRole, {
     onPeerPresent: () => {
       $('connect-status').textContent = 'Other Mac is here. Opening a direct link…'
       $('wait-status').textContent = 'Other Mac is here. Opening a direct link…'
+      if (reconnecting) $('transfer-file').textContent = 'Other Mac is here. Opening a direct link…'
       releasePeer()
     },
     onSignal: (message) => {
@@ -161,23 +229,30 @@ async function connect(nextRole: Role, code: string): Promise<void> {
     onStatus: (text) => {
       $('connect-status').textContent = text
       $('wait-status').textContent = text
+      if (reconnecting) $('transfer-file').textContent = text
     },
     onError: (error) => {
       if (peer) return
-      fail(error)
+      failConnect(error)
     },
   })
 
   if (nextRole === 'sender') {
-    $('wait-status').textContent = 'Waiting for the other Mac…'
-    await peerPresent
-    show('connecting')
-    $('connect-status').textContent = 'Other Mac is here. Opening a direct link…'
+    if (!reconnecting) $('wait-status').textContent = 'Waiting for the other Mac…'
+    await Promise.race([peerPresent, connectionDied])
+    if (!reconnecting) {
+      show('connecting')
+      $('connect-status').textContent = 'Other Mac is here. Opening a direct link…'
+    }
   }
 
-  peer = await startPeer(nextRole, signaling, attachSignal, (text) => {
-    $('connect-status').textContent = text
-  })
+  peer = await Promise.race([
+    startPeer(nextRole, signaling, attachSignal, (text) => {
+      $('connect-status').textContent = text
+      if (reconnecting) $('transfer-file').textContent = text
+    }),
+    connectionDied,
+  ])
 }
 
 async function beginSend(existingCode?: string): Promise<void> {
@@ -214,26 +289,43 @@ async function beginSend(existingCode?: string): Promise<void> {
     files: existing?.files,
   })
 
+  stopAutoResume = false
+  wake = new WakeGuard()
+  await wake.start()
+  let attempt = 0
   try {
-    await connect('sender', code)
-    const inbox = new ChannelInbox(peer!.channel)
-    gate = new TransferGate()
-    wake = new WakeGuard()
-    await wake.start()
-    show('transfer')
-    $('transfer-title').textContent = 'Sending'
-    $('btn-pause').textContent = 'Pause'
-    await sendFolder({
-      channel: peer!.channel,
-      dataChannels: peer!.dataChannels,
-      pc: peer!.pc,
-      inbox,
-      roomCode: code,
-      files: scanned,
-      manifest,
-      gate,
-      onProgress: renderProgress,
-    })
+    while (!stopAutoResume) {
+      try {
+        if (attempt > 0) {
+          showReconnecting(attempt)
+          await closeLink()
+          await waitForRetry(attempt)
+          if (stopAutoResume) throw new Error('Transfer cancelled')
+        }
+        await connect('sender', code, attempt > 0)
+        const inbox = new ChannelInbox(peer!.channel)
+        gate = new TransferGate()
+        show('transfer')
+        $('transfer-title').textContent = 'Sending'
+        $('btn-pause').textContent = 'Pause'
+        await sendFolder({
+          channel: peer!.channel,
+          dataChannels: peer!.dataChannels,
+          pc: peer!.pc,
+          inbox,
+          roomCode: code,
+          files: scanned,
+          manifest,
+          gate,
+          onProgress: renderProgress,
+        })
+        break
+      } catch (error) {
+        if (!recoverableError(error)) throw error
+        attempt += 1
+      }
+    }
+    if (stopAutoResume) throw new Error('Transfer cancelled')
     await clearSession(code)
     $('done-title').textContent = 'Sent'
     $('done-body').textContent = `${manifest.files.length} files (${formatBytes(manifest.totalBytes)}) reached the other Mac.`
@@ -261,28 +353,45 @@ async function beginReceive(code: string, resume?: SessionRecord): Promise<void>
     files: resume?.files,
   })
 
+  stopAutoResume = false
+  wake = new WakeGuard()
+  await wake.start()
+  let attempt = 0
   try {
-    await connect('receiver', code)
-    const inbox = new ChannelInbox(peer!.channel)
-    gate = new TransferGate()
-    wake = new WakeGuard()
-    await wake.start()
-    show('transfer')
-    $('transfer-title').textContent = 'Receiving'
-    $('btn-pause').textContent = 'Pause'
-    await receiveFolder({
-      channel: peer!.channel,
-      dataChannels: peer!.dataChannels,
-      pc: peer!.pc,
-      inbox,
-      roomCode: code,
-      dest: destHandle,
-      gate,
-      onManifest: (manifest) => {
-        $('transfer-file').textContent = `Receiving ${manifest.folderName} · ${manifest.files.length} files`
-      },
-      onProgress: renderProgress,
-    })
+    while (!stopAutoResume) {
+      try {
+        if (attempt > 0) {
+          showReconnecting(attempt)
+          await closeLink()
+          await waitForRetry(attempt)
+          if (stopAutoResume) throw new Error('Transfer cancelled')
+        }
+        await connect('receiver', code, attempt > 0)
+        const inbox = new ChannelInbox(peer!.channel)
+        gate = new TransferGate()
+        show('transfer')
+        $('transfer-title').textContent = 'Receiving'
+        $('btn-pause').textContent = 'Pause'
+        await receiveFolder({
+          channel: peer!.channel,
+          dataChannels: peer!.dataChannels,
+          pc: peer!.pc,
+          inbox,
+          roomCode: code,
+          dest: destHandle,
+          gate,
+          onManifest: (manifest) => {
+            $('transfer-file').textContent = `Receiving ${manifest.folderName} · ${manifest.files.length} files`
+          },
+          onProgress: renderProgress,
+        })
+        break
+      } catch (error) {
+        if (!recoverableError(error)) throw error
+        attempt += 1
+      }
+    }
+    if (stopAutoResume) throw new Error('Transfer cancelled')
     await clearSession(code)
     $('done-title').textContent = 'Received'
     $('done-body').textContent = `The folder is on this Mac. Keep the destination window handy if you want to check it.`
@@ -391,6 +500,7 @@ async function resumeLast(): Promise<void> {
 }
 
 function resetHome(): void {
+  stopAutoResume = true
   void teardown(false)
   sourceHandle = null
   destHandle = null
@@ -505,6 +615,7 @@ $('btn-pause').addEventListener('click', () => {
 })
 
 $('btn-cancel').addEventListener('click', () => {
+  stopAutoResume = true
   try {
     if (peer) sendControl(peer.channel, { type: 'cancel', reason: 'Cancelled by the other Mac' })
   } catch {
