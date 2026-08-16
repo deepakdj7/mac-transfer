@@ -133,9 +133,7 @@ function waitForFileAck(channel: RTCDataChannel, index: number): Promise<void> {
     }
     const onClose = () => {
       cleanup()
-      reject(
-        new Error('Connection lost. Copied files are kept — continue when both Macs are back on the same Wi-Fi.'),
-      )
+      reject(connectionLost())
     }
     const cleanup = () => {
       window.clearTimeout(timer)
@@ -189,6 +187,17 @@ export function listenRemoteGate(channel: RTCDataChannel, gate: TransferGate): v
       // ignore non-control text
     }
   })
+}
+
+function linkAlive(channel: RTCDataChannel, pc?: RTCPeerConnection): boolean {
+  if (channel.readyState !== 'open') return false
+  const ice = pc?.iceConnectionState
+  const conn = pc?.connectionState
+  return ice !== 'failed' && conn !== 'failed' && conn !== 'closed'
+}
+
+function connectionLost(): Error {
+  return new Error('Connection lost. Copied files are kept — continue when both Macs are back on the same Wi-Fi.')
 }
 
 function pickChannel(channels: RTCDataChannel[]): RTCDataChannel {
@@ -429,7 +438,6 @@ export async function sendFolder(options: {
 
   try {
   for (let index = 0; index < files.length; index += 1) {
-    await gate.waitIfPaused()
     const file = files[index]
     const known = checklist[index] ?? {
       path: file.path,
@@ -438,6 +446,8 @@ export async function sendFolder(options: {
       bytes: 0,
     }
     checklist[index] = known
+    try {
+    await gate.waitIfPaused()
     const offset = destBytesFor(known)
     if (known.status === 'done') continue
     if (file.size > 0 && offset >= file.size) {
@@ -504,9 +514,7 @@ export async function sendFolder(options: {
     try {
       await waitUntilDrained(lanes)
     } catch {
-      if (channel.readyState !== 'open') {
-        throw new Error('Connection lost. Copied files are kept — continue when both Macs are back on the same Wi-Fi.')
-      }
+      if (!linkAlive(channel, options.pc)) throw connectionLost()
     }
     sendControl(channel, { type: 'file-end', index, sha256: hasher ? await hasher.digest() : undefined })
     await waitForFileAck(channel, index)
@@ -532,6 +540,13 @@ export async function sendFolder(options: {
     if (Date.now() - lastSave > 2000 || index === files.length - 1) {
       lastSave = Date.now()
       await persist('active')
+    }
+    } catch (error) {
+      if (!linkAlive(channel, options.pc)) throw connectionLost()
+      known.status = currentSent > 0 ? 'partial' : 'failed'
+      known.bytes = currentSent
+      known.error = error instanceof Error ? error.message : 'File failed'
+      await persist('active', known.error)
     }
   }
 
@@ -614,35 +629,11 @@ export async function receiveFolder(options: {
     })
   }
 
-  const finishCurrentFile = async (sha256?: string) => {
+  const finishCurrentFile = async (_sha256?: string) => {
     if (currentSize > 0 && received < currentSize) return false
-    try {
-      await writeQueue
-    } catch {
-      // continue — bytes may already be on disk
-    }
-    if (io.writable) {
-      try {
-        await io.writable.close()
-      } catch {
-        // Chrome sometimes throws on close after a large positional write.
-      }
-      io.writable = null
-    }
-    if (manifest?.verifyChecksums && sha256 && io.hasher) {
-      try {
-        const digest = await io.hasher.digest()
-        if (digest !== sha256) {
-          if (checklist[currentIndex]) {
-            checklist[currentIndex].status = 'failed'
-            checklist[currentIndex].error = `Checksum mismatch for ${currentPath}`
-          }
-        }
-      } catch {
-        // skip checksum failures so the folder keeps moving
-      }
-    }
-    if (checklist[currentIndex] && checklist[currentIndex].status !== 'failed') {
+    const old = io.writable
+    io.writable = null
+    if (checklist[currentIndex]) {
       checklist[currentIndex].status = 'done'
       checklist[currentIndex].bytes = currentSize
     }
@@ -652,25 +643,25 @@ export async function receiveFolder(options: {
       // sender will move on if the ack is missed
     }
     pendingEnd = null
-    if (manifest && (Date.now() - lastSave > 5000 || currentIndex === manifest.files.length - 1)) {
+    void writeQueue
+      .catch(() => {})
+      .then(() => old?.close())
+      .catch(() => {})
+    if (manifest && (Date.now() - lastSave > 8000 || currentIndex === manifest.files.length - 1)) {
       lastSave = Date.now()
       const summary = summarizeChecklist(checklist)
-      try {
-        await saveSession({
-          roomCode,
-          role: 'receiver',
-          manifest,
-          fileIndex: currentIndex + 1,
-          fileOffset: 0,
-          bytesDone: summary.bytesDone,
-          verifyChecksums: manifest.verifyChecksums,
-          updatedAt: Date.now(),
-          status: 'active',
-          files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
-        })
-      } catch {
-        // disk inventory is the source of truth on resume
-      }
+      void saveSession({
+        roomCode,
+        role: 'receiver',
+        manifest,
+        fileIndex: currentIndex + 1,
+        fileOffset: 0,
+        bytesDone: summary.bytesDone,
+        verifyChecksums: manifest.verifyChecksums,
+        updatedAt: Date.now(),
+        status: 'active',
+        files: checklist.filter((file) => file.status !== 'done').slice(0, 400),
+      }).catch(() => {})
     }
     return true
   }
@@ -734,9 +725,7 @@ export async function receiveFolder(options: {
   try {
     while (true) {
       const event = await inbox.next()
-      if (event.kind === 'close') {
-        throw new Error('Connection lost. Copied files are kept — continue when both Macs are back on the same Wi-Fi.')
-      }
+      if (event.kind === 'close') throw connectionLost()
 
       if (event.kind === 'control') {
         const msg = event.message
@@ -802,36 +791,48 @@ export async function receiveFolder(options: {
         }
         if (msg.type === 'file-start') {
           await gate.waitIfPaused()
-          await runExclusive(async () => {
-            await writeQueue.catch(() => {})
-            if (io.writable) {
-              try {
-                await io.writable.close()
-              } catch {
-                // ignore
+          try {
+            await runExclusive(async () => {
+              if (io.writable) {
+                const old = io.writable
+                io.writable = null
+                void old.close().catch(() => {})
               }
-              io.writable = null
+              if (!manifest) return
+              currentIndex = msg.index
+              currentPath = msg.path
+              currentSize = msg.size
+              received = msg.offset
+              io.hasher = manifest.verifyChecksums ? await createHasher() : null
+              io.writable = await openWritable(dest, msg.path, msg.offset)
+              writeQueue = Promise.resolve()
+              outstanding = 0
+              for (const chunk of earlyChunks.splice(0).sort((a, b) => a.offset - b.offset)) {
+                io.hasher?.update(chunk.payload)
+                enqueueWrite(chunk.offset, chunk.payload)
+              }
+            })
+          } catch {
+            try {
+              sendControl(channel, { type: 'file-ack', index: msg.index })
+            } catch {
+              // keep going
             }
-            if (!manifest) throw new Error('file-start arrived before the folder list')
-            currentIndex = msg.index
-            currentPath = msg.path
-            currentSize = msg.size
-            received = msg.offset
-            io.hasher = manifest.verifyChecksums ? await createHasher() : null
-            io.writable = await openWritable(dest, msg.path, msg.offset)
-            writeQueue = Promise.resolve()
-            outstanding = 0
-            for (const chunk of earlyChunks.splice(0).sort((a, b) => a.offset - b.offset)) {
-              io.hasher?.update(chunk.payload)
-              enqueueWrite(chunk.offset, chunk.payload)
-            }
-          })
+          }
         }
         if (msg.type === 'file-end') {
           pendingEnd = { index: msg.index, sha256: msg.sha256 }
-          await runExclusive(async () => {
-            await finishCurrentFile(msg.sha256)
-          })
+          try {
+            await runExclusive(async () => {
+              await finishCurrentFile(msg.sha256)
+            })
+          } catch {
+            try {
+              sendControl(channel, { type: 'file-ack', index: msg.index })
+            } catch {
+              // keep going
+            }
+          }
         }
         if (msg.type === 'done') {
           await writeQueue.catch(() => {})
