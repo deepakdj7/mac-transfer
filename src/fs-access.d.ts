@@ -47,6 +47,10 @@ interface DirectoryPickerOptions {
   startIn?: FileSystemHandle | 'desktop' | 'documents' | 'downloads' | 'music' | 'pictures' | 'videos'
 }
 
+interface DataTransferItem {
+  getAsFileSystemHandle?(): Promise<FileSystemHandle | null>
+}
+
 interface Window {
   showDirectoryPicker(options?: DirectoryPickerOptions): Promise<FileSystemDirectoryHandle>
 }

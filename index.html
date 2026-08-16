@@ -14,7 +14,7 @@
           <span class="mark" aria-hidden="true"></span>
           <div>
             <p class="brand-name">Mac Transfer</p>
-            <p class="brand-sub">Same Wi-Fi · Chrome or Edge · up to 100 GB · build 16 Aug · auto-resume</p>
+            <p class="brand-sub">Same Wi-Fi · Chrome or Edge · up to 100 GB · build 16 Aug · nearby</p>
           </div>
         </div>
         <p class="secure">Files stay on your LAN</p>
@@ -25,14 +25,21 @@
 
       <main>
         <section id="view-home" class="view">
-          <h1>Move a folder from this Mac to the other one.</h1>
+          <h1>People nearby</h1>
           <p class="lede">
-            Both computers open this page, join the same room, and the folder streams disk-to-disk over Wi-Fi.
-            GitHub never sees the files.
+            Open this page on the other Mac. Click their circle — or drop a folder on it — to send.
+            Files stay on your Wi-Fi.
           </p>
+          <p id="lobby-status" class="status">Looking for this Wi-Fi…</p>
+          <div id="incoming" class="banner incoming hidden">
+            <span id="incoming-text">Someone wants to send a folder.</span>
+            <button id="btn-accept" class="btn primary" type="button">Accept</button>
+          </div>
+          <div id="peer-grid" class="peer-grid"></div>
           <div class="actions">
-            <button id="btn-send" class="btn primary" type="button">Send a folder</button>
-            <button id="btn-recv" class="btn" type="button">Receive a folder</button>
+            <button id="btn-ready" class="btn primary" type="button">Ready to receive</button>
+            <button id="btn-send" class="btn" type="button">Room code instead</button>
+            <button id="btn-recv" class="btn ghost" type="button">Join a room code</button>
           </div>
           <div id="resume-card" class="card hidden">
             <p class="card-kicker">Unfinished transfer</p>
@@ -63,14 +70,14 @@
             Verify SHA-256 checksums (safer, much slower)
           </label>
           <div class="actions">
-            <button id="btn-create-room" class="btn primary" type="button">Create room</button>
+            <button id="btn-create-room" class="btn primary" type="button">Send</button>
             <button id="btn-send-cancel" class="btn ghost" type="button">Back</button>
           </div>
         </section>
 
         <section id="view-send-wait" class="view hidden">
-          <h1>On the other Mac, join this room</h1>
-          <p class="lede">Open Mac Transfer in Chrome or Edge, tap Receive, and type this code.</p>
+          <h1 id="wait-title">On the other Mac, join this room</h1>
+          <p id="wait-lede" class="lede">Open Mac Transfer in Chrome or Edge, tap Receive, and type this code.</p>
           <div class="code-box">
             <p id="room-code" class="room-code">————</p>
             <button id="btn-copy" class="btn ghost" type="button">Copy</button>

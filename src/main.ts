@@ -5,6 +5,7 @@ import { leftoverFiles, summarizeChecklist } from './checklist.ts'
 import { scanFolder, summarizeScan, type ScannedFile } from './fs.ts'
 import { clearSession, ensureHandlePermission, getHandle, getSession, latestSession, saveHandle, saveSession } from './idb.ts'
 import { startPeer, type PeerConnection } from './peer.ts'
+import { joinLobby, type Lobby, type LobbyInvite, type LobbyPeer } from './presence.ts'
 import { joinSignalRoom, type SignalingRoom } from './signaling.ts'
 import { ChannelInbox, receiveFolder, sendControl, sendFolder, TransferGate } from './transfer.ts'
 import type { FileProgress, Manifest, Role, SessionRecord, SignalMessage, TransferProgress } from './types.ts'
@@ -37,6 +38,10 @@ let wake: WakeGuard | null = null
 let signalHandler: ((message: SignalMessage) => void) | null = null
 let lastRole: Role | null = null
 let stopAutoResume = false
+let lobby: Lobby | null = null
+let nearby: LobbyPeer[] = []
+let pendingInvite: LobbyInvite | null = null
+let busy = false
 const bufferedSignals: SignalMessage[] = []
 
 function show(view: View): void {
@@ -255,7 +260,7 @@ async function connect(nextRole: Role, code: string, reconnecting = false): Prom
   ])
 }
 
-async function beginSend(existingCode?: string): Promise<void> {
+async function beginSend(existingCode?: string, nearbyName?: string): Promise<void> {
   if (!sourceHandle || scanned.length === 0) return
   const code = existingCode ?? randomRoomCode()
   roomCode = code
@@ -264,6 +269,17 @@ async function beginSend(existingCode?: string): Promise<void> {
   const anchor = $('join-link') as HTMLAnchorElement
   anchor.href = link
   anchor.textContent = link
+  if (nearbyName) {
+    $('wait-title').textContent = `Sending to ${nearbyName}`
+    $('wait-lede').textContent = 'The other Mac should accept on its own if it is ready to receive. Keep this tab open.'
+    $('join-link-wrap').classList.add('hidden')
+    $('room-code').parentElement?.classList.add('hidden')
+  } else {
+    $('wait-title').textContent = 'On the other Mac, join this room'
+    $('wait-lede').textContent = 'Open Mac Transfer in Chrome or Edge, tap Receive, and type this code.'
+    $('join-link-wrap').classList.remove('hidden')
+    $('room-code').parentElement?.classList.remove('hidden')
+  }
   show('send-wait')
 
   const verify = ($('chk-verify') as HTMLInputElement).checked
@@ -402,17 +418,103 @@ async function beginReceive(code: string, resume?: SessionRecord): Promise<void>
   }
 }
 
-async function pickAndScan(): Promise<void> {
-  const support = supportMessage()
-  if (support) {
-    setWarn(support)
+function initials(name: string): string {
+  return name
+    .split(/\s+/)
+    .slice(0, 2)
+    .map((part) => part[0] ?? '')
+    .join('')
+    .toUpperCase()
+}
+
+function renderLobby(): void {
+  const grid = $('peer-grid')
+  grid.replaceChildren()
+  const cards: Array<LobbyPeer & { you?: boolean }> = lobby ? [{ ...lobby.me, you: true }, ...nearby] : nearby
+  if (cards.length === 0) {
+    const empty = document.createElement('p')
+    empty.className = 'hint'
+    empty.textContent = 'No other Mac yet. Keep this tab open on both computers.'
+    grid.append(empty)
     return
   }
-  sourceHandle = await window.showDirectoryPicker({ mode: 'read', id: 'mac-transfer-source' })
+  for (const peer of cards) {
+    const button = document.createElement('button')
+    button.type = 'button'
+    button.className = peer.you ? 'peer you' : 'peer'
+    button.dataset.id = peer.id
+    const avatar = document.createElement('span')
+    avatar.className = 'avatar'
+    avatar.style.setProperty('--hue', String(peer.hue))
+    avatar.textContent = initials(peer.name)
+    const name = document.createElement('span')
+    name.className = 'peer-name'
+    name.textContent = peer.name
+    const meta = document.createElement('span')
+    meta.className = 'peer-meta'
+    meta.textContent = peer.you
+      ? destHandle
+        ? 'You · ready to receive'
+        : 'You · click Ready to receive'
+      : peer.ready
+        ? 'Ready · click or drop a folder'
+        : 'Click to send a folder'
+    button.append(avatar, name, meta)
+    if (!peer.you) {
+      button.addEventListener('click', () => {
+        void sendToPeer(peer).catch(ignoreAbort)
+      })
+      button.addEventListener('dragover', (event) => {
+        event.preventDefault()
+        button.classList.add('drop')
+      })
+      button.addEventListener('dragleave', () => button.classList.remove('drop'))
+      button.addEventListener('drop', (event) => {
+        event.preventDefault()
+        button.classList.remove('drop')
+        void sendDroppedFolder(peer, event.dataTransfer).catch(ignoreAbort)
+      })
+    }
+    grid.append(button)
+  }
+}
+
+function ignoreAbort(error: unknown): void {
+  if (error instanceof DOMException && error.name === 'AbortError') return
+  fail(error)
+}
+
+function showIncoming(invite: LobbyInvite): void {
+  pendingInvite = invite
+  $('incoming-text').textContent = `${invite.fromName} wants to send a folder.`
+  $('incoming').classList.remove('hidden')
+}
+
+async function acceptInvite(invite: LobbyInvite): Promise<void> {
+  if (busy) return
+  if (!destHandle) {
+    destHandle = await pickDest()
+    if (!destHandle) return
+    await saveHandle('lobby', 'dest', destHandle)
+    lobby?.setReady(true)
+    $('btn-ready').textContent = 'Receiving folder is set'
+  }
+  pendingInvite = null
+  $('incoming').classList.add('hidden')
+  busy = true
+  try {
+    await beginReceive(invite.room, await getSession(invite.room))
+  } finally {
+    busy = false
+  }
+}
+
+async function scanSource(handle: FileSystemDirectoryHandle): Promise<boolean> {
+  sourceHandle = handle
   show('send-scan')
-  $('scan-status').textContent = `Reading “${sourceHandle.name}”…`
+  $('scan-status').textContent = `Reading “${handle.name}”…`
   scanned = await scanFolder(
-    sourceHandle,
+    handle,
     (info) => {
       $('scan-status').textContent = `Found ${info.fileCount} files · ${formatBytes(info.totalBytes)}`
     },
@@ -420,10 +522,10 @@ async function pickAndScan(): Promise<void> {
   )
   if (scanned.length === 0) {
     fail(new Error('That folder is empty, or every file was unreadable.'))
-    return
+    return false
   }
   const total = scanned.reduce((sum, file) => sum + file.size, 0)
-  $('send-folder-name').textContent = sourceHandle.name
+  $('send-folder-name').textContent = handle.name
   $('send-file-count').textContent = String(scanned.length)
   $('send-total-size').textContent = formatBytes(total)
   const summary = summarizeScan(scanned)
@@ -437,7 +539,77 @@ async function pickAndScan(): Promise<void> {
     hints.push('At least one file is 10 GB or larger. Keep this tab visible until it finishes writing.')
   }
   $('send-hint').textContent = hints.join(' ')
-  show('send-ready')
+  return true
+}
+
+async function sendToPeer(peer: LobbyPeer, handle?: FileSystemDirectoryHandle): Promise<void> {
+  if (busy) return
+  const support = supportMessage()
+  if (support) {
+    setWarn(support)
+    return
+  }
+  const folder = handle ?? (await window.showDirectoryPicker({ mode: 'read', id: 'mac-transfer-source' }))
+  if (!(await scanSource(folder))) return
+  const code = randomRoomCode()
+  lobby?.invite(peer.id, code)
+  busy = true
+  try {
+    await beginSend(code, peer.name)
+  } finally {
+    busy = false
+  }
+}
+
+async function sendDroppedFolder(peer: LobbyPeer, transfer: DataTransfer | null): Promise<void> {
+  if (!transfer) return
+  for (const item of transfer.items) {
+    const handle = await item.getAsFileSystemHandle?.()
+    if (handle?.kind === 'directory') {
+      await sendToPeer(peer, handle as FileSystemDirectoryHandle)
+      return
+    }
+  }
+  setWarn('Drop a folder, not a single file.')
+}
+
+async function startLobby(): Promise<void> {
+  if (lobby) return
+  try {
+    lobby = await joinLobby({
+      onPeers(peers) {
+        nearby = peers
+        renderLobby()
+      },
+      onInvite(invite) {
+        if (busy) return
+        if (destHandle) {
+          void acceptInvite(invite).catch(ignoreAbort)
+          return
+        }
+        showIncoming(invite)
+      },
+      onStatus(text) {
+        $('lobby-status').textContent = text
+      },
+    })
+    if (destHandle) lobby.setReady(true)
+    renderLobby()
+  } catch (error) {
+    $('lobby-status').textContent =
+      'Could not find nearby devices. Use a room code, or check that both Macs can reach the internet for the handshake.'
+    console.warn(error)
+  }
+}
+
+async function pickAndScan(): Promise<void> {
+  const support = supportMessage()
+  if (support) {
+    setWarn(support)
+    return
+  }
+  const handle = await window.showDirectoryPicker({ mode: 'read', id: 'mac-transfer-source' })
+  if (await scanSource(handle)) show('send-ready')
 }
 
 async function pickDest(): Promise<FileSystemDirectoryHandle | null> {
@@ -501,20 +673,37 @@ async function resumeLast(): Promise<void> {
 
 function resetHome(): void {
   stopAutoResume = true
+  busy = false
+  pendingInvite = null
+  $('incoming').classList.add('hidden')
   void teardown(false)
   sourceHandle = null
-  destHandle = null
   scanned = []
   roomCode = ''
   show('home')
   void loadResumeCard()
+  renderLobby()
+  void startLobby()
 }
 
+$('btn-ready').addEventListener('click', () => {
+  void (async () => {
+    destHandle = await pickDest()
+    if (!destHandle) return
+    await saveHandle('lobby', 'dest', destHandle)
+    lobby?.setReady(true)
+    $('btn-ready').textContent = 'Receiving folder is set'
+    renderLobby()
+    if (pendingInvite) await acceptInvite(pendingInvite)
+  })().catch(ignoreAbort)
+})
+
+$('btn-accept').addEventListener('click', () => {
+  if (pendingInvite) void acceptInvite(pendingInvite).catch(ignoreAbort)
+})
+
 $('btn-send').addEventListener('click', () => {
-  void pickAndScan().catch((error) => {
-    if (error instanceof DOMException && error.name === 'AbortError') return
-    fail(error)
-  })
+  void pickAndScan().catch(ignoreAbort)
 })
 
 $('btn-recv').addEventListener('click', () => {
@@ -647,4 +836,12 @@ if (preset) {
   ;($('join-code') as HTMLInputElement).value = preset
 }
 
-void loadResumeCard()
+void (async () => {
+  const saved = await getHandle('lobby', 'dest')
+  if (saved && (await ensureHandlePermission(saved, 'readwrite'))) {
+    destHandle = saved
+    $('btn-ready').textContent = 'Receiving folder is set'
+  }
+  await loadResumeCard()
+  await startLobby()
+})()

@@ -1,7 +1,7 @@
 import mqtt, { type MqttClient } from 'mqtt'
 import type { Role, SignalMessage } from './types.ts'
 
-const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt']
+export const BROKERS = ['wss://broker.emqx.io:8084/mqtt', 'wss://broker.hivemq.com:8884/mqtt']
 const APP = 'mac-transfer-v1'
 
 export type SignalingHandlers = {
@@ -25,7 +25,7 @@ function topics(roomCode: string) {
   }
 }
 
-function connectBroker(url: string, clientId: string, willTopic: string): Promise<MqttClient> {
+export function connectBroker(url: string, clientId: string, willTopic: string): Promise<MqttClient> {
   return new Promise((resolve, reject) => {
     const client = mqtt.connect(url, {
       clientId,

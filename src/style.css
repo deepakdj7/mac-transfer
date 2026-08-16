@@ -32,7 +32,7 @@ body {
 }
 
 .shell {
-  width: min(760px, calc(100% - 32px));
+  width: min(860px, calc(100% - 32px));
   margin: 0 auto;
   padding: 28px 0 48px;
 }
@@ -269,6 +269,75 @@ dd {
 .banner {
   background: rgba(214, 255, 74, 0.1);
   color: #e8ff9a;
+}
+
+.incoming {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.peer-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 16px;
+  margin-top: 28px;
+}
+
+.peer {
+  appearance: none;
+  border: 1px dashed var(--line);
+  background: rgba(24, 29, 22, 0.55);
+  color: inherit;
+  border-radius: 22px;
+  padding: 22px 12px 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  min-height: 180px;
+}
+
+.peer:hover,
+.peer.drop {
+  border-color: var(--accent);
+  background: rgba(214, 255, 74, 0.06);
+}
+
+.peer.you {
+  cursor: default;
+  border-style: solid;
+}
+
+.peer.you:hover {
+  border-color: var(--line);
+  background: rgba(24, 29, 22, 0.55);
+}
+
+.avatar {
+  width: 84px;
+  height: 84px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-weight: 750;
+  letter-spacing: -0.04em;
+  color: #10200c;
+  background: hsl(var(--hue, 90) 70% 62%);
+  box-shadow: 0 0 0 6px hsla(var(--hue, 90), 70%, 62%, 0.16);
+}
+
+.peer-name {
+  font-weight: 650;
+  text-align: center;
+}
+
+.peer-meta {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
 }
 
 .warn {
